@@ -2,7 +2,7 @@
 
 Vertical minimalist task bar for Windows 11 (also runs on Windows 10): a text-only taskbar. No icons — every running window and pinned app is a compact, old-school bevel button, packed down one edge of the screen.
 
-- **Running windows** at the top, **pinned apps** (your own + your Windows Start menu pins) at the bottom, a **clock** last
+- **Running windows** at the top, **pinned apps** (your own + your Windows Start menu pins) below, then a **clock** and a `░▒▓█` **start button** at the very bottom
 - **Word-wrapped** titles, so long names stay readable instead of truncating
 - **Focused window** drawn pressed with a white border; minimized windows dimmed; windows asking for attention highlighted
 - **Hover to focus** — resting on a button brings that window to the front instantly
@@ -24,9 +24,9 @@ To replace the Windows taskbar entirely: turn on taskbar auto-hide in Windows se
 | Mouse | Running window | Pinned app | Clock / empty space |
 |---|---|---|---|
 | Hover | Bring to front | — | — |
-| Left-click | Focus, or minimize if already focused | Launch | — |
+| Left-click | Focus, or minimize if already focused | Launch | — (start button: Start menu) |
 | Middle-click | Close | — | — |
-| Right-click | Window menu | Pin menu | Position, reload, edit config, exit |
+| Right-click | Window menu | Pin menu | Position, reload, edit config, exit (start button: Win+X menu) |
 | Wheel | Scroll the window list | Scroll the pinned list | — |
 
 ## Configuration
@@ -41,7 +41,9 @@ Edit `vbar.ini` (right-click the clock → **Edit config**), then right-click �
 
 **Colours:** `bg`, `outline`, `hi`, `face`, `activeface`, `pinface`, `clockface`, `text`, `hovertext`, `activetext`, `dim`, `flash`, `activeborder`
 
-**Behaviour:** `bordermode` (`focused` / `visible` / `off`), `hoverfocus`, `hoverdelay` (ms, 0 = instant), `hoverrestore`, `clock`, `hidetaskbar`
+**Behaviour:** `bordermode` (`focused` / `visible` / `off`), `hoverfocus`, `hoverdelay` (ms, 0 = instant), `hoverrestore`, `hidetaskbar`
+
+**Clock & start button:** `clock`, `clockfontsize` (0 = same as `fontsize`), `clocklines` (wraps if too wide), `clockbold`, `startbutton`, `startheight` (0 = one text line), `startcolor`
 
 **Audio meter:** `meter`, `meterh`, `metercolor`, `meterdb` (dB range across full width, 0 = linear), `meterfall`, `meterfps`
 

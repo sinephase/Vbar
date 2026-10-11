@@ -67,7 +67,7 @@
 #define IDM_P_ADMIN    301
 #define IDM_P_LOCATION 302
 
-enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_NONE = -1 };
+enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_START = 3, K_NONE = -1 };
 
 struct Pin  { std::wstring name, path, args, dir, aumid; };
 struct Task { HWND hwnd; std::wstring title; bool flash; bool iconic; bool visible;
@@ -82,6 +82,10 @@ struct Config {
     bool aa = false, clock = true, hideTaskbar = false, ellipsis = true, startPins = true, italic = false;
     bool bold = false, hoverRestore = false, hoverFocus = true, meter = true, rightSide = false;
     int monitor = 0;   // 0 = primary, otherwise Windows display number
+    int clockFontSize = 0, clockLines = 2, clockBold = -1, startHeight = 0;   // 0 / -1 = follow the main font
+    bool startButton = true;
+    COLORREF startColor = RGB(216, 216, 216);
+    bool startColorSet = false;
     int meterH = 2, meterFall = 4, meterDb = 48, meterFps = 30;
     COLORREF bg = RGB(0, 0, 0), face = RGB(64, 64, 64), text = RGB(216, 216, 216),
              hi = RGB(255, 255, 255), dim = RGB(136, 136, 136), flash = RGB(110, 110, 110),
@@ -95,7 +99,7 @@ struct Config {
 
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
-static HFONT g_font = nullptr;
+static HFONT g_font = nullptr, g_clockFont = nullptr;
 static std::wstring g_exeDir, g_iniPath, g_loadedFontFile;
 static std::vector<Task> g_tasks;
 static std::vector<Pin> g_startPins;
@@ -410,6 +414,17 @@ static const char* kDefaultIni =
 "; 0 = crisp non-antialiased, 1 = ClearType\n"
 "aa=0\n"
 "clock=1\n"
+"; clock text size in px (0 = same as fontsize); it wraps onto up to clocklines lines if it doesn't fit\n"
+"clockfontsize=0\n"
+"clocklines=2\n"
+"; clockbold=1   (leave out to follow bold)\n"
+"\n"
+"; start button at the very bottom: click = Start menu, right-click = Win+X menu\n"
+"startbutton=1\n"
+"; height in px (0 = same as a one-line button)\n"
+"startheight=0\n"
+"; colour of the shade blocks (leave out to follow text)\n"
+";startcolor=#D8D8D8\n"
 "; 1 = hovering a running window's button brings that window to the front\n"
 "hoverfocus=1\n"
 "; ms to wait before raising (0 = instant)\n"
@@ -537,6 +552,12 @@ static void LoadConfig() {
         else if (k == L"fontfile")    g_cfg.fontFile = v;
         else if (k == L"aa")          g_cfg.aa = n != 0;
         else if (k == L"clock")       g_cfg.clock = n != 0;
+        else if (k == L"clockfontsize") g_cfg.clockFontSize = std::max(0, n);
+        else if (k == L"clocklines")  g_cfg.clockLines = std::max(1, n);
+        else if (k == L"clockbold")   g_cfg.clockBold = n != 0;
+        else if (k == L"startbutton") g_cfg.startButton = n != 0;
+        else if (k == L"startheight") g_cfg.startHeight = std::max(0, n);
+        else if (k == L"startcolor")  { g_cfg.startColor = ParseColor(v, g_cfg.startColor); g_cfg.startColorSet = true; }
         else if (k == L"hidetaskbar") g_cfg.hideTaskbar = n != 0;
         else if (k == L"side") {
             std::wstring m = v;
@@ -565,6 +586,7 @@ static void LoadConfig() {
         }
     }
 
+    if (!g_cfg.startColorSet) g_cfg.startColor = g_cfg.text;
     if (!g_cfg.activeFaceSet) g_cfg.activeFace = g_cfg.face;
     if (!g_cfg.pinFaceSet)    g_cfg.pinFace = g_cfg.face;
     if (!g_cfg.clockFaceSet)  g_cfg.clockFace = g_cfg.face;
@@ -577,6 +599,7 @@ static void LoadConfig() {
 
 static void CreateBarFont() {
     if (g_font) { DeleteObject(g_font); g_font = nullptr; }
+    if (g_clockFont) { DeleteObject(g_clockFont); g_clockFont = nullptr; }
     if (!g_loadedFontFile.empty()) {
         RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
         g_loadedFontFile.clear();
@@ -590,6 +613,12 @@ static void CreateBarFont() {
                          OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          g_cfg.aa ? CLEARTYPE_QUALITY : NONANTIALIASED_QUALITY,
                          FIXED_PITCH | FF_MODERN, g_cfg.font.c_str());
+    bool cb = g_cfg.clockBold < 0 ? g_cfg.bold : g_cfg.clockBold != 0;
+    int cweight = cb ? std::max(g_cfg.fontWeight, (int)FW_BOLD) : g_cfg.fontWeight;
+    g_clockFont = CreateFontW(-(g_cfg.clockFontSize ? g_cfg.clockFontSize : g_cfg.fontSize), 0, 0, 0, cweight,
+                              g_cfg.italic, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              g_cfg.aa ? CLEARTYPE_QUALITY : NONANTIALIASED_QUALITY,
+                              FIXED_PITCH | FF_MODERN, g_cfg.font.c_str());
 }
 
 // ---------- taskbar / appbar ----------
@@ -899,6 +928,25 @@ static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, i
     DeleteObject(clip);
 }
 
+// ░▒▓█ drawn as real pixel dither patterns, stretched across the button, so it's crisp in any font.
+static void DrawStartButton(HDC dc, RECT r, COLORREF border, COLORREF face, COLORREF ink) {
+    DrawButton(dc, r, false, border, face, ink, {});
+    RECT a{r.left + 1 + g_cfg.pad, r.top + 1 + g_cfg.vpad, r.right - 1 - g_cfg.pad, r.bottom - 1 - g_cfg.vpad};
+    int w = a.right - a.left;
+    if (w < 4 || a.bottom <= a.top) return;
+    for (int c = 0; c < 4; ++c) {
+        int x0 = a.left + w * c / 4, x1 = a.left + w * (c + 1) / 4;
+        if (c == 3) { Fill(dc, RECT{x0, a.top, x1, a.bottom}, ink); continue; }
+        for (int y = a.top; y < a.bottom; ++y)
+            for (int x = x0; x < x1; ++x) {
+                bool on = c == 0 ? (x % 2 == 0 && y % 2 == 0)       // ░ 25%
+                        : c == 1 ? ((x + y) % 2 == 0)                // ▒ 50%
+                        :          !(x % 2 == 1 && y % 2 == 1);      // ▓ 75%
+                if (on) SetPixelV(dc, x, y, ink);
+            }
+    }
+}
+
 static void Paint(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC hdc = BeginPaint(hwnd, &ps);
@@ -928,10 +976,27 @@ static void Paint(HWND hwnd) {
         pins.push_back(Item{K_PIN, i, lines, ButtonHeight((int)lines.size())});
     }
 
-    // Layout: [running windows ... scrolls] gap [pinned ... anchored to bottom] gap [clock]
-    int clockH = g_cfg.clock ? ButtonHeight(1) : 0;
-    int clockTop = H - clockH;
-    int bottomLimit = g_cfg.clock ? clockTop - g_cfg.gap : H;
+    // Clock: own font size, wraps if it doesn't fit the bar width.
+    std::vector<std::wstring> clockLines;
+    int clockLineH = g_lineH;
+    if (g_cfg.clock) {
+        SelectObject(mdc, g_clockFont);
+        TEXTMETRICW ctm;
+        GetTextMetricsW(mdc, &ctm);
+        clockLineH = ctm.tmHeight;
+        clockLines = Wrap(mdc, ClockText(), textW, g_cfg.clockLines);
+        SelectObject(mdc, g_font);
+    }
+
+    // Layout, top to bottom:
+    // [running windows ... scrolls] gap [pinned ... anchored low] gap [clock] spacing [start]
+    int startH = g_cfg.startButton ? (g_cfg.startHeight ? g_cfg.startHeight : ButtonHeight(1)) : 0;
+    int startTop = H - startH;
+    int clockH = g_cfg.clock ? 2 + 2 * g_cfg.vpad + (int)clockLines.size() * clockLineH +
+                               ((int)clockLines.size() - 1) * g_cfg.lineGap : 0;
+    int clockTop = (g_cfg.startButton ? startTop - g_cfg.spacing : H) - clockH;
+    int bottomLimit = g_cfg.clock ? clockTop - g_cfg.gap
+                    : g_cfg.startButton ? startTop - g_cfg.gap : H;
 
     int pinsContent = ContentHeight(pins);
     int pinsArea = pins.empty() ? 0 : std::min(pinsContent, std::max(0, bottomLimit) * g_cfg.pinsMax / 100);
@@ -949,10 +1014,21 @@ static void Paint(HWND hwnd) {
     DrawRegion(mdc, W, pins, g_pinsTop, g_pinsBottom, g_scrollPins, fg);
 
     if (g_cfg.clock) {
-        RECT r{0, clockTop, W, H};
+        RECT r{0, clockTop, W, clockTop + clockH};
         bool hov = g_hoverKind == K_CLOCK;
-        DrawButton(mdc, r, false, g_cfg.outline, g_cfg.clockFace, hov ? g_cfg.hoverText : g_cfg.text, {ClockText()});
-        g_rows.push_back(Row{r, K_CLOCK, 0, clockTop, H});
+        SelectObject(mdc, g_clockFont);
+        int saved = g_lineH;
+        g_lineH = clockLineH;
+        DrawButton(mdc, r, false, g_cfg.outline, g_cfg.clockFace, hov ? g_cfg.hoverText : g_cfg.text, clockLines);
+        g_lineH = saved;
+        SelectObject(mdc, g_font);
+        g_rows.push_back(Row{r, K_CLOCK, 0, r.top, r.bottom});
+    }
+    if (g_cfg.startButton) {
+        RECT r{0, startTop, W, H};
+        bool hov = g_hoverKind == K_START;
+        DrawStartButton(mdc, r, g_cfg.outline, g_cfg.clockFace, hov ? g_cfg.hoverText : g_cfg.startColor);
+        g_rows.push_back(Row{r, K_START, 0, startTop, H});
     }
 
     BitBlt(hdc, 0, 0, W, H, mdc, 0, 0, SRCCOPY);
@@ -1120,6 +1196,17 @@ static void ActivateOrMinimize(HWND h) {
     } else {
         ForceForeground(h);
     }
+}
+
+// Press keys down in order, release in reverse (e.g. {VK_LWIN, 'X'} = Win+X).
+static void PressKeys(std::initializer_list<WORD> keys) {
+    std::vector<INPUT> in;
+    for (WORD k : keys) { INPUT i{}; i.type = INPUT_KEYBOARD; i.ki.wVk = k; in.push_back(i); }
+    for (auto it = keys.end(); it != keys.begin();) {
+        --it;
+        INPUT i{}; i.type = INPUT_KEYBOARD; i.ki.wVk = *it; i.ki.dwFlags = KEYEVENTF_KEYUP; in.push_back(i);
+    }
+    SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
 }
 
 static void LaunchPin(const Pin& p) {
@@ -1418,6 +1505,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_HOVER);                 // a click wins over a pending hover-raise
         const Row* r = HitTest((short)LOWORD(lp), (short)HIWORD(lp));
         if (!r) return 0;
+        if (r->kind == K_START) { PressKeys({VK_LWIN}); return 0; }
         if (r->kind == K_PIN && r->idx < PinCount()) LaunchPin(PinAt(r->idx));
         else if (r->kind == K_TASK && r->idx < (int)g_tasks.size()) ActivateOrMinimize(g_tasks[r->idx].hwnd);
         RefreshTasks();
@@ -1434,6 +1522,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
         const Row* r = HitTest(pt.x, pt.y);
         int kind = r ? r->kind : K_NONE, idx = r ? r->idx : -1;
+        if (kind == K_START) { PressKeys({VK_LWIN, 'X'}); return 0; }
         ClientToScreen(hwnd, &pt);
         if (kind == K_PIN && idx < PinCount()) ShowPinMenu(idx, pt);
         else if (kind == K_TASK && idx < (int)g_tasks.size()) ShowTaskMenu(g_tasks[idx].hwnd, pt);
@@ -1463,6 +1552,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ShowSystemTaskbars(true);
         if (!g_loadedFontFile.empty()) RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
         if (g_font) DeleteObject(g_font);
+        if (g_clockFont) DeleteObject(g_clockFont);
         PostQuitMessage(0);
         return 0;
     }
