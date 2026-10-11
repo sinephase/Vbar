@@ -1,0 +1,1524 @@
+// vbar.cpp - text-only vertical taskbar for Windows 10/11
+// Old-school bevel buttons: black outline, white corner highlight, dark grey face, light grey text.
+// Running windows at the top, pinned apps (yours + Windows Start pins) at the bottom, clock last.
+//
+// Build (MSVC, x64 Native Tools prompt):
+//   cl /O2 /EHsc /DUNICODE /D_UNICODE vbar.cpp /link /SUBSYSTEM:WINDOWS
+// Build (MinGW-w64):
+//   g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid
+//
+// First run writes vbar.ini next to the exe. Edit it, then right-click the clock > Reload.
+
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0A00
+#endif
+#include <windows.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <dwmapi.h>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <fstream>
+#include <sstream>
+#include <cmath>
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "ole32.lib")
+#endif
+
+#define WM_APPBAR    (WM_APP + 1)
+#define WM_STARTPINS (WM_APP + 2)
+#define TIMER_CLOCK 1
+#define TIMER_SCAN 2
+#define TIMER_HOVER 3
+#define TIMER_METER 4
+#define IDM_RELOAD 100
+#define IDM_EDIT 101
+#define IDM_EXIT 102
+#define IDM_SIDE_LEFT 110
+#define IDM_SIDE_RIGHT 111
+#define IDM_MON_PRIMARY 119
+#define IDM_MON_BASE 120
+#define IDM_T_SWITCH   200
+#define IDM_T_RESTORE  201
+#define IDM_T_MINIMIZE 202
+#define IDM_T_MAXIMIZE 203
+#define IDM_T_CLOSE    204
+#define IDM_T_LOCATION 205
+#define IDM_T_KILL     206
+#define IDM_T_NEW      207
+#define IDM_P_OPEN     300
+#define IDM_P_ADMIN    301
+#define IDM_P_LOCATION 302
+
+enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_NONE = -1 };
+
+struct Pin  { std::wstring name, path, args, dir, aumid; };
+struct Task { HWND hwnd; std::wstring title; bool flash; bool iconic; bool visible;
+              DWORD pid = 0; std::wstring exe; float level = 0; };
+struct Row  { RECT r; int kind; int idx; int clipTop; int clipBottom; };
+struct Item { int kind; int idx; std::vector<std::wstring> lines; int h; };
+
+struct Config {
+    int width = 120, gap = 6, spacing = 2, pad = 4, vpad = 2, lineGap = 0, maxLines = 3;
+    int highlight = 4, fontSize = 12, fontWeight = 400, pinsMax = 60, hoverDelay = 0, borderMode = 1;
+    std::wstring font = L"Consolas", fontFile, pinDir;
+    bool aa = false, clock = true, hideTaskbar = false, ellipsis = true, startPins = true, italic = false;
+    bool bold = false, hoverRestore = false, hoverFocus = true, meter = true, rightSide = false;
+    int monitor = 0;   // 0 = primary, otherwise Windows display number
+    int meterH = 2, meterFall = 4, meterDb = 48, meterFps = 30;
+    COLORREF bg = RGB(0, 0, 0), face = RGB(64, 64, 64), text = RGB(216, 216, 216),
+             hi = RGB(255, 255, 255), dim = RGB(136, 136, 136), flash = RGB(110, 110, 110),
+             outline = RGB(0, 0, 0), hoverText = RGB(255, 255, 255), activeText = RGB(255, 255, 255),
+             activeFace = RGB(64, 64, 64), pinFace = RGB(64, 64, 64), clockFace = RGB(64, 64, 64),
+             activeBorder = RGB(255, 255, 255), meterColor = RGB(47, 125, 255);
+    bool activeFaceSet = false, pinFaceSet = false, clockFaceSet = false;
+    std::vector<std::wstring> strip;
+    std::vector<Pin> pins;
+};
+
+static Config g_cfg;
+static HWND g_hwnd = nullptr;
+static HFONT g_font = nullptr;
+static std::wstring g_exeDir, g_iniPath, g_loadedFontFile;
+static std::vector<Task> g_tasks;
+static std::vector<Pin> g_startPins;
+static std::vector<Row> g_rows;
+static int g_scrollTasks = 0, g_scrollPins = 0, g_lineH = 14;
+static int g_tasksTop = 0, g_tasksBottom = 0, g_pinsTop = 0, g_pinsBottom = 0;
+static int g_hoverKind = K_NONE, g_hoverIdx = -1;
+static bool g_tracking = false;
+static UINT g_shellMsg = 0, g_taskbarCreatedMsg = 0;
+static HWND g_lastFg = nullptr;
+static int g_lastMinute = -1;
+static LONG g_startPinsGen = 0;
+
+// ---------- helpers ----------
+
+static std::string WToUtf8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static std::wstring Utf8ToW(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w(n, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+
+static std::wstring DecodeText(const std::string& raw) {
+    if (raw.size() >= 2 && (unsigned char)raw[0] == 0xFF && (unsigned char)raw[1] == 0xFE) {
+        std::wstring w((raw.size() - 2) / 2, 0);
+        memcpy(&w[0], raw.data() + 2, w.size() * 2);
+        return w;
+    }
+    if (raw.size() >= 3 && (unsigned char)raw[0] == 0xEF && (unsigned char)raw[1] == 0xBB && (unsigned char)raw[2] == 0xBF)
+        return Utf8ToW(raw.substr(3));
+    return Utf8ToW(raw);
+}
+
+static std::string ReadFileBytes(const std::wstring& path) {
+    std::ifstream f(path.c_str(), std::ios::binary);
+    if (!f) return "";
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+}
+
+static std::wstring Trim(const std::wstring& s) {
+    size_t a = s.find_first_not_of(L" \t\r\n");
+    if (a == std::wstring::npos) return L"";
+    size_t b = s.find_last_not_of(L" \t\r\n");
+    return s.substr(a, b - a + 1);
+}
+
+static std::vector<std::wstring> Split(const std::wstring& s, wchar_t d) {
+    std::vector<std::wstring> out;
+    size_t start = 0;
+    for (;;) {
+        size_t p = s.find(d, start);
+        out.push_back(Trim(s.substr(start, p == std::wstring::npos ? std::wstring::npos : p - start)));
+        if (p == std::wstring::npos) break;
+        start = p + 1;
+    }
+    return out;
+}
+
+static COLORREF ParseColor(const std::wstring& v, COLORREF def) {
+    std::wstring s = v;
+    if (!s.empty() && s[0] == L'#') s = s.substr(1);
+    if (s.size() != 6) return def;
+    unsigned long x = wcstoul(s.c_str(), nullptr, 16);
+    return RGB((x >> 16) & 255, (x >> 8) & 255, x & 255);
+}
+
+static std::wstring ExpandEnv(const std::wstring& s) {
+    if (s.empty()) return s;
+    wchar_t buf[2048];
+    DWORD n = ExpandEnvironmentStringsW(s.c_str(), buf, 2048);
+    return (n && n <= 2048) ? std::wstring(buf) : s;
+}
+
+static std::wstring Resolve(const std::wstring& p) {
+    std::wstring e = ExpandEnv(p);
+    if (e.size() > 1 && (e[1] == L':' || (e[0] == L'\\' && e[1] == L'\\'))) return e;
+    return g_exeDir + L"\\" + e;
+}
+
+static std::wstring FileStem(const std::wstring& path) {
+    size_t s = path.find_last_of(L"\\/");
+    std::wstring fn = s == std::wstring::npos ? path : path.substr(s + 1);
+    size_t dot = fn.find_last_of(L'.');
+    return dot == std::wstring::npos ? fn : fn.substr(0, dot);
+}
+
+static void Fill(HDC dc, const RECT& r, COLORREF c) {
+    SetDCBrushColor(dc, c);
+    FillRect(dc, &r, (HBRUSH)GetStockObject(DC_BRUSH));
+}
+
+static std::wstring ProcessPath(HWND h) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return L"";
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = MAX_PATH * 2;
+    std::wstring out;
+    if (QueryFullProcessImageNameW(p, 0, buf, &n)) out.assign(buf, n);
+    CloseHandle(p);
+    return out;
+}
+
+static void OpenLocation(const std::wstring& path) {
+    if (path.empty()) return;
+    std::wstring args = L"/select,\"" + path + L"\"";
+    ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+}
+
+// ---------- pins ----------
+
+static int PinCount() { return (int)(g_cfg.pins.size() + g_startPins.size()); }
+static const Pin& PinAt(int i) {
+    return i < (int)g_cfg.pins.size() ? g_cfg.pins[i] : g_startPins[i - g_cfg.pins.size()];
+}
+
+static std::vector<Pin> ListShortcutDir(const std::wstring& dir) {
+    std::vector<Pin> found;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return found;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring fn = fd.cFileName;
+        size_t dot = fn.find_last_of(L'.');
+        if (dot == std::wstring::npos) continue;
+        std::wstring ext = fn.substr(dot);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        if (ext != L".lnk" && ext != L".url" && ext != L".exe") continue;
+        Pin p;
+        p.name = fn.substr(0, dot);
+        p.path = dir + L"\\" + fn;
+        found.push_back(p);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    std::sort(found.begin(), found.end(), [](const Pin& a, const Pin& b) {
+        return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+    return found;
+}
+
+// Minimal JSON string reader: s[i] == '"' on entry, returns value, leaves i after the closing quote.
+static std::wstring JsonString(const std::wstring& s, size_t& i) {
+    std::wstring out;
+    ++i;
+    while (i < s.size() && s[i] != L'"') {
+        wchar_t c = s[i++];
+        if (c == L'\\' && i < s.size()) {
+            wchar_t e = s[i++];
+            switch (e) {
+            case L'n': out += L'\n'; break;
+            case L't': out += L'\t'; break;
+            case L'r': out += L'\r'; break;
+            case L'b': out += L'\b'; break;
+            case L'f': out += L'\f'; break;
+            case L'u':
+                if (i + 4 <= s.size()) { out += (wchar_t)wcstoul(s.substr(i, 4).c_str(), nullptr, 16); i += 4; }
+                break;
+            default: out += e; break;     // \\  \"  \/
+            }
+        } else {
+            out += c;
+        }
+    }
+    if (i < s.size()) ++i;
+    return out;
+}
+
+static std::wstring AppDisplayName(const std::wstring& aumid) {
+    std::wstring name;
+    std::wstring parse = L"shell:AppsFolder\\" + aumid;
+    IShellItem* item = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(parse.c_str(), nullptr, IID_IShellItem, (void**)&item)) && item) {
+        PWSTR n = nullptr;
+        if (SUCCEEDED(item->GetDisplayName(SIGDN_NORMALDISPLAY, &n)) && n) {
+            name = n;
+            CoTaskMemFree(n);
+        }
+        item->Release();
+    }
+    if (name.empty()) {                       // fall back to something readable from the id
+        name = aumid;
+        size_t bang = name.find(L'!');
+        if (bang != std::wstring::npos) name = name.substr(0, bang);
+        size_t us = name.find(L'_');
+        if (us != std::wstring::npos) name = name.substr(0, us);
+        size_t dot = name.find_last_of(L'.');
+        if (dot != std::wstring::npos && dot + 1 < name.size()) name = name.substr(dot + 1);
+    }
+    return name;
+}
+
+// Asks Windows for its own Start layout (Export-StartLayout) and turns the pinned list into Pins.
+// Falls back to the taskbar's pinned shortcuts folder if that yields nothing.
+static std::vector<Pin> LoadStartPins() {
+    std::vector<Pin> pins;
+
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    std::wstring json = std::wstring(tmp) + L"vbar_startlayout.json";
+    DeleteFileW(json.c_str());
+
+    std::wstring quoted;
+    for (wchar_t c : json) { quoted += c; if (c == L'\'') quoted += L'\''; }
+    std::wstring cmd = L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
+                       L"\"Export-StartLayout -Path '" + quoted + L"'\"";
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                       nullptr, nullptr, &si, &pi)) {
+        WaitForSingleObject(pi.hProcess, 20000);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+
+    std::wstring s = DecodeText(ReadFileBytes(json));
+    size_t i = 0;
+    while (i < s.size()) {
+        if (s[i] != L'"') { ++i; continue; }
+        std::wstring key = JsonString(s, i);
+        size_t j = i;
+        while (j < s.size() && iswspace(s[j])) ++j;
+        if (j >= s.size() || s[j] != L':') continue;
+        ++j;
+        while (j < s.size() && iswspace(s[j])) ++j;
+        if (j >= s.size() || s[j] != L'"') { i = j; continue; }
+        i = j;
+        std::wstring val = JsonString(s, i);
+        if (val.empty()) continue;
+        Pin p;
+        if (key == L"desktopAppLink") {
+            p.path = ExpandEnv(val);
+            p.name = FileStem(p.path);
+        } else if (key == L"packagedAppId" || key == L"desktopAppId") {
+            p.aumid = val;
+            p.name = AppDisplayName(val);
+        } else {
+            continue;
+        }
+        if (!p.name.empty()) pins.push_back(p);
+    }
+    DeleteFileW(json.c_str());
+
+    if (pins.empty())
+        pins = ListShortcutDir(ExpandEnv(L"%APPDATA%\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar"));
+    return pins;
+}
+
+struct StartPinsResult { LONG gen; std::vector<Pin> pins; };
+
+static DWORD WINAPI StartPinsThread(LPVOID param) {
+    LONG gen = (LONG)(LONG_PTR)param;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    StartPinsResult* res = new StartPinsResult{gen, LoadStartPins()};
+    CoUninitialize();
+    if (!PostMessageW(g_hwnd, WM_STARTPINS, 0, (LPARAM)res)) delete res;
+    return 0;
+}
+
+static void RequestStartPins() {
+    LONG gen = InterlockedIncrement(&g_startPinsGen);
+    if (!g_cfg.startPins) { g_startPins.clear(); return; }
+    HANDLE t = CreateThread(nullptr, 0, StartPinsThread, (LPVOID)(LONG_PTR)gen, 0, nullptr);
+    if (t) CloseHandle(t);
+}
+
+// ---------- config ----------
+
+static const char* kDefaultIni =
+"; vbar.ini  - edit, then right-click the clock > Reload\n"
+"; All sizes are physical pixels. Comments must be on their own line.\n"
+"\n"
+"width=120\n"
+"; black space between buttons\n"
+"spacing=2\n"
+"; black gap between the running-windows section, the pinned section and the clock\n"
+"gap=6\n"
+"; text padding inside a button: pad = left/right, vpad = top/bottom\n"
+"pad=4\n"
+"vpad=2\n"
+"; extra pixels between wrapped lines\n"
+"linegap=0\n"
+"; wrapped lines per button before cutting off (1 = no wrapping)\n"
+"maxlines=3\n"
+"; 1 = end a cut-off line with an ellipsis\n"
+"ellipsis=1\n"
+"; white corner highlight length in px (0 = full top/left edges)\n"
+"highlight=4\n"
+"\n"
+"font=Consolas\n"
+"fontsize=12\n"
+"; 1 = bold (same as fontweight=700)\n"
+"bold=0\n"
+"; finer control: 100-900 (400 = normal, 700 = bold, 900 = black)\n"
+"fontweight=400\n"
+"italic=0\n"
+"; optional font file next to vbar.exe, loaded privately (e.g. TerminusTTF-4.49.3.ttf, then font=Terminus (TTF))\n"
+"fontfile=\n"
+"; 0 = crisp non-antialiased, 1 = ClearType\n"
+"aa=0\n"
+"clock=1\n"
+"; 1 = hovering a running window's button brings that window to the front\n"
+"hoverfocus=1\n"
+"; ms to wait before raising (0 = instant)\n"
+"hoverdelay=0\n"
+"; 1 = hovering also restores minimized windows\n"
+"hoverrestore=0\n"
+"\n"
+"; ---- audio meter: a bar along the bottom of any running window's button that's playing sound ----\n"
+"meter=1\n"
+"; bar height in px (sits in the bottom padding, so keep vpad >= meterh)\n"
+"meterh=2\n"
+"metercolor=#2F7DFF\n"
+"; dB range shown across the full width (0 = linear amplitude instead)\n"
+"meterdb=48\n"
+"; how fast the bar falls back, in % of full width per frame\n"
+"meterfall=4\n"
+"; updates per second while sound is playing\n"
+"meterfps=30\n"
+"; 1 = hide the Windows taskbar while vbar runs (also turn on taskbar auto-hide so it frees the screen space)\n"
+"hidetaskbar=0\n"
+"; which screen: primary, or the display number Windows shows in Settings > Display > Identify\n"
+"monitor=primary\n"
+"; left or right edge of that screen\n"
+"side=left\n"
+"\n"
+"; ---- colours (#RRGGBB) ----\n"
+"; bar background (also the space between buttons)\n"
+"bg=#000000\n"
+"; 1px border around every button\n"
+"outline=#000000\n"
+"; border colour for running-window buttons picked out by bordermode\n"
+"activeborder=#FFFFFF\n"
+"; focused = only the window in front | visible = every window not fully covered or minimized | off\n"
+"bordermode=focused\n"
+"; corner highlight\n"
+"hi=#FFFFFF\n"
+"; button face; activeface / pinface / clockface override it per kind (leave out to follow face)\n"
+"face=#404040\n"
+";activeface=#404040\n"
+";pinface=#404040\n"
+";clockface=#404040\n"
+"; text: normal, hovered, focused window, minimized window\n"
+"text=#D8D8D8\n"
+"hovertext=#FFFFFF\n"
+"activetext=#FFFFFF\n"
+"dim=#888888\n"
+"; face of a window asking for attention\n"
+"flash=#6E6E6E\n"
+"\n"
+"; suffixes trimmed from window titles\n"
+"strip=- Google Chrome\n"
+"strip=- Mozilla Firefox\n"
+"strip=- Microsoft Edge\n"
+"strip=- Brave\n"
+"strip=- Visual Studio Code\n"
+"strip=- Notepad\n"
+"strip=- File Explorer\n"
+"\n"
+"; ---- pinned section (bottom of the bar) ----\n"
+"; 1 = include your Windows Start menu pins (read via Export-StartLayout; falls back to taskbar pins)\n"
+"startpins=1\n"
+"; most of the bar's height the pinned section may take, in percent (it scrolls past that)\n"
+"pinsmax=60\n"
+"; your own pins, listed first: pin=Name|path|args|working dir   (env vars like %USERPROFILE% work)\n"
+"; pin=Terminal|wt.exe\n"
+"; optional folder of shortcuts (.lnk/.url/.exe), listed alphabetically after the pin= lines\n"
+"pindir=\n";
+
+static void LoadConfig() {
+    g_cfg = Config();
+    std::string raw = ReadFileBytes(g_iniPath);
+    if (raw.empty()) {
+        std::ofstream o(g_iniPath.c_str(), std::ios::binary);
+        o << kDefaultIni;
+        o.close();
+        raw = kDefaultIni;
+    }
+    std::wstring text = DecodeText(raw);
+
+    std::wstringstream ws(text);
+    std::wstring line;
+    while (std::getline(ws, line)) {
+        line = Trim(line);
+        if (line.empty() || line[0] == L';' || line[0] == L'#') continue;
+        size_t eq = line.find(L'=');
+        if (eq == std::wstring::npos) continue;
+        std::wstring k = Trim(line.substr(0, eq)), v = Trim(line.substr(eq + 1));
+        std::transform(k.begin(), k.end(), k.begin(), ::towlower);
+        int n = _wtoi(v.c_str());
+        if      (k == L"width")       g_cfg.width = std::max(20, n);
+        else if (k == L"gap")         g_cfg.gap = std::max(0, n);
+        else if (k == L"spacing")     g_cfg.spacing = std::max(0, n);
+        else if (k == L"pad")         g_cfg.pad = std::max(0, n);
+        else if (k == L"vpad")        g_cfg.vpad = std::max(0, n);
+        else if (k == L"linegap")     g_cfg.lineGap = std::max(0, n);
+        else if (k == L"maxlines")    g_cfg.maxLines = std::max(1, n);
+        else if (k == L"ellipsis")    g_cfg.ellipsis = n != 0;
+        else if (k == L"highlight")   g_cfg.highlight = std::max(0, n);
+        else if (k == L"font")        { if (!v.empty()) g_cfg.font = v; }
+        else if (k == L"fontsize")    g_cfg.fontSize = std::max(5, n);
+        else if (k == L"fontweight")  g_cfg.fontWeight = std::max(100, std::min(900, n));
+        else if (k == L"italic")      g_cfg.italic = n != 0;
+        else if (k == L"bold")        g_cfg.bold = n != 0;
+        else if (k == L"hoverfocus")  g_cfg.hoverFocus = n != 0;
+        else if (k == L"hoverdelay")  g_cfg.hoverDelay = std::max(0, n);
+        else if (k == L"activeborder") g_cfg.activeBorder = ParseColor(v, g_cfg.activeBorder);
+        else if (k == L"bordermode") {
+            std::wstring m = v;
+            std::transform(m.begin(), m.end(), m.begin(), ::towlower);
+            g_cfg.borderMode = m == L"off" ? 0 : m == L"visible" ? 2 : 1;
+        }
+        else if (k == L"hoverrestore") g_cfg.hoverRestore = n != 0;
+        else if (k == L"meter")       g_cfg.meter = n != 0;
+        else if (k == L"meterh")      g_cfg.meterH = std::max(1, n);
+        else if (k == L"meterfall")   g_cfg.meterFall = std::max(1, std::min(100, n));
+        else if (k == L"meterdb")     g_cfg.meterDb = std::max(0, n);
+        else if (k == L"meterfps")    g_cfg.meterFps = std::max(5, std::min(120, n));
+        else if (k == L"metercolor")  g_cfg.meterColor = ParseColor(v, g_cfg.meterColor);
+        else if (k == L"outline")     g_cfg.outline = ParseColor(v, g_cfg.outline);
+        else if (k == L"hovertext")   g_cfg.hoverText = ParseColor(v, g_cfg.hoverText);
+        else if (k == L"activetext")  g_cfg.activeText = ParseColor(v, g_cfg.activeText);
+        else if (k == L"activeface")  { g_cfg.activeFace = ParseColor(v, g_cfg.activeFace); g_cfg.activeFaceSet = true; }
+        else if (k == L"pinface")     { g_cfg.pinFace = ParseColor(v, g_cfg.pinFace); g_cfg.pinFaceSet = true; }
+        else if (k == L"clockface")   { g_cfg.clockFace = ParseColor(v, g_cfg.clockFace); g_cfg.clockFaceSet = true; }
+        else if (k == L"fontfile")    g_cfg.fontFile = v;
+        else if (k == L"aa")          g_cfg.aa = n != 0;
+        else if (k == L"clock")       g_cfg.clock = n != 0;
+        else if (k == L"hidetaskbar") g_cfg.hideTaskbar = n != 0;
+        else if (k == L"side") {
+            std::wstring m = v;
+            std::transform(m.begin(), m.end(), m.begin(), ::towlower);
+            g_cfg.rightSide = m == L"right";
+        }
+        else if (k == L"monitor")     g_cfg.monitor = std::max(0, n);   // "primary" parses as 0
+        else if (k == L"startpins")   g_cfg.startPins = n != 0;
+        else if (k == L"pinsmax")     g_cfg.pinsMax = std::max(10, std::min(100, n));
+        else if (k == L"bg")          g_cfg.bg = ParseColor(v, g_cfg.bg);
+        else if (k == L"face")        g_cfg.face = ParseColor(v, g_cfg.face);
+        else if (k == L"text")        g_cfg.text = ParseColor(v, g_cfg.text);
+        else if (k == L"hi")          g_cfg.hi = ParseColor(v, g_cfg.hi);
+        else if (k == L"dim")         g_cfg.dim = ParseColor(v, g_cfg.dim);
+        else if (k == L"flash")       g_cfg.flash = ParseColor(v, g_cfg.flash);
+        else if (k == L"strip")       { if (!v.empty()) g_cfg.strip.push_back(v); }
+        else if (k == L"pindir")      g_cfg.pinDir = v;
+        else if (k == L"pin") {
+            auto parts = Split(v, L'|');
+            Pin p;
+            p.name = parts.size() > 0 ? parts[0] : L"";
+            p.path = parts.size() > 1 ? parts[1] : L"";
+            p.args = parts.size() > 2 ? parts[2] : L"";
+            p.dir  = parts.size() > 3 ? parts[3] : L"";
+            if (!p.name.empty() && !p.path.empty()) g_cfg.pins.push_back(p);
+        }
+    }
+
+    if (!g_cfg.activeFaceSet) g_cfg.activeFace = g_cfg.face;
+    if (!g_cfg.pinFaceSet)    g_cfg.pinFace = g_cfg.face;
+    if (!g_cfg.clockFaceSet)  g_cfg.clockFace = g_cfg.face;
+
+    if (!g_cfg.pinDir.empty()) {
+        auto found = ListShortcutDir(Resolve(g_cfg.pinDir));
+        g_cfg.pins.insert(g_cfg.pins.end(), found.begin(), found.end());
+    }
+}
+
+static void CreateBarFont() {
+    if (g_font) { DeleteObject(g_font); g_font = nullptr; }
+    if (!g_loadedFontFile.empty()) {
+        RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
+        g_loadedFontFile.clear();
+    }
+    if (!g_cfg.fontFile.empty()) {
+        std::wstring p = Resolve(g_cfg.fontFile);
+        if (AddFontResourceExW(p.c_str(), FR_PRIVATE, nullptr) > 0) g_loadedFontFile = p;
+    }
+    int weight = g_cfg.bold ? std::max(g_cfg.fontWeight, (int)FW_BOLD) : g_cfg.fontWeight;
+    g_font = CreateFontW(-g_cfg.fontSize, 0, 0, 0, weight, g_cfg.italic, FALSE, FALSE, DEFAULT_CHARSET,
+                         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                         g_cfg.aa ? CLEARTYPE_QUALITY : NONANTIALIASED_QUALITY,
+                         FIXED_PITCH | FF_MODERN, g_cfg.font.c_str());
+}
+
+// ---------- taskbar / appbar ----------
+
+static void ShowSystemTaskbars(bool show) {
+    int cmd = show ? SW_SHOW : SW_HIDE;
+    if (HWND t = FindWindowW(L"Shell_TrayWnd", nullptr)) ShowWindow(t, cmd);
+    HWND s = nullptr;
+    while ((s = FindWindowExW(nullptr, s, L"Shell_SecondaryTrayWnd", nullptr)) != nullptr) ShowWindow(s, cmd);
+}
+
+struct Mon { HMONITOR h; RECT rc; int num; bool primary; };
+
+static BOOL CALLBACK MonProc(HMONITOR hm, HDC, LPRECT, LPARAM lp) {
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(hm, &mi)) return TRUE;
+    std::wstring dev = mi.szDevice;                       // e.g. \\.\DISPLAY2
+    size_t d = dev.find_last_not_of(L"0123456789");
+    int num = (d != std::wstring::npos && d + 1 < dev.size()) ? _wtoi(dev.c_str() + d + 1) : 0;
+    ((std::vector<Mon>*)lp)->push_back(Mon{hm, mi.rcMonitor, num, (mi.dwFlags & MONITORINFOF_PRIMARY) != 0});
+    return TRUE;
+}
+
+static std::vector<Mon> Monitors() {
+    std::vector<Mon> v;
+    EnumDisplayMonitors(nullptr, nullptr, MonProc, (LPARAM)&v);
+    std::sort(v.begin(), v.end(), [](const Mon& a, const Mon& b) { return a.num < b.num; });
+    return v;
+}
+
+// The configured screen, or the primary one if it isn't connected.
+static HMONITOR PickMonitor() {
+    if (g_cfg.monitor > 0)
+        for (auto& m : Monitors()) if (m.num == g_cfg.monitor) return m.h;
+    return MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+}
+
+static void AppBarSetPos() {
+    HMONITOR mon = PickMonitor();
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(mon, &mi);
+
+    APPBARDATA abd{};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = g_hwnd;
+    abd.uEdge = g_cfg.rightSide ? ABE_RIGHT : ABE_LEFT;
+    abd.rc = mi.rcMonitor;
+    if (g_cfg.rightSide) abd.rc.left = abd.rc.right - g_cfg.width;
+    else abd.rc.right = abd.rc.left + g_cfg.width;
+    SHAppBarMessage(ABM_QUERYPOS, &abd);                 // the shell may move our edge in (other appbars)
+    if (g_cfg.rightSide) abd.rc.left = abd.rc.right - g_cfg.width;
+    else abd.rc.right = abd.rc.left + g_cfg.width;
+    SHAppBarMessage(ABM_SETPOS, &abd);
+
+    SetWindowPos(g_hwnd, HWND_TOPMOST, abd.rc.left, abd.rc.top,
+                 abd.rc.right - abd.rc.left, abd.rc.bottom - abd.rc.top, SWP_NOACTIVATE);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void AppBarRegister() {
+    APPBARDATA abd{};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = g_hwnd;
+    abd.uCallbackMessage = WM_APPBAR;
+    SHAppBarMessage(ABM_NEW, &abd);
+    AppBarSetPos();
+}
+
+static void AppBarRemove() {
+    APPBARDATA abd{};
+    abd.cbSize = sizeof(abd);
+    abd.hWnd = g_hwnd;
+    SHAppBarMessage(ABM_REMOVE, &abd);
+}
+
+// ---------- window list ----------
+
+static bool IsTaskWindow(HWND h) {
+    if (h == g_hwnd || !IsWindowVisible(h)) return false;
+    LONG_PTR ex = GetWindowLongPtrW(h, GWL_EXSTYLE);
+    bool appWin = (ex & WS_EX_APPWINDOW) != 0;
+    if (!appWin) {
+        if (GetWindow(h, GW_OWNER)) return false;
+        if (ex & WS_EX_TOOLWINDOW) return false;
+        if (ex & WS_EX_NOACTIVATE) return false;
+    }
+    int cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
+    if (GetWindowTextLengthW(h) == 0) return false;
+    wchar_t cls[64];
+    GetClassNameW(h, cls, 64);
+    if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
+        !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, L"Shell_SecondaryTrayWnd")) return false;
+    return true;
+}
+
+static std::wstring CleanTitle(HWND h) {
+    int len = GetWindowTextLengthW(h);
+    std::wstring t(len + 1, 0);
+    GetWindowTextW(h, &t[0], len + 1);
+    t.resize(wcslen(t.c_str()));
+    t.erase(std::remove(t.begin(), t.end(), L'​'), t.end());   // Edge pads its name with zero-width spaces
+    for (auto& s : g_cfg.strip) {
+        if (t.size() > s.size() && t.compare(t.size() - s.size(), s.size(), s) == 0) {
+            t.resize(t.size() - s.size());
+            t = Trim(t);
+            break;
+        }
+    }
+    return t;
+}
+
+static BOOL CALLBACK EnumProc(HWND h, LPARAM lp) {
+    if (IsTaskWindow(h)) ((std::vector<HWND>*)lp)->push_back(h);
+    return TRUE;
+}
+
+// Rebuilds the task list keeping existing order; returns true if anything visible changed.
+static bool RefreshTasks() {
+    std::vector<HWND> found;
+    EnumWindows(EnumProc, (LPARAM)&found);
+    HWND fg = GetForegroundWindow();
+
+    std::vector<Task> next;
+    for (auto& t : g_tasks)
+        if (std::find(found.begin(), found.end(), t.hwnd) != found.end()) next.push_back(t);
+    for (HWND h : found) {
+        bool have = std::any_of(next.begin(), next.end(), [h](const Task& t) { return t.hwnd == h; });
+        if (!have) {
+            Task t{h, L"", false, false, false};
+            GetWindowThreadProcessId(h, &t.pid);
+            t.exe = ProcessPath(h);
+            next.push_back(t);
+        }
+    }
+
+    // Which windows show any pixels: walk top-to-bottom z-order, subtracting the windows above.
+    std::vector<HWND> shown;
+    if (g_cfg.borderMode == 2) {
+        RECT screen{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
+        screen.right = screen.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        screen.bottom = screen.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        std::vector<RECT> above;
+        for (HWND h : found) {                       // EnumWindows returns top-most first
+            if (IsIconic(h)) continue;
+            RECT wr;
+            if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &wr, sizeof(wr)))) GetWindowRect(h, &wr);
+            RECT vis;
+            if (!IntersectRect(&vis, &wr, &screen)) continue;
+            HRGN rg = CreateRectRgnIndirect(&vis);
+            int res = SIMPLEREGION;
+            for (auto& a : above) {
+                HRGN ar = CreateRectRgnIndirect(&a);
+                res = CombineRgn(rg, rg, ar, RGN_DIFF);
+                DeleteObject(ar);
+                if (res == NULLREGION) break;
+            }
+            DeleteObject(rg);
+            if (res != NULLREGION) shown.push_back(h);
+            above.push_back(wr);
+        }
+    }
+
+    for (auto& t : next) {
+        t.title = CleanTitle(t.hwnd);
+        t.iconic = IsIconic(t.hwnd) != 0;
+        t.visible = std::find(shown.begin(), shown.end(), t.hwnd) != shown.end();
+        if (t.hwnd == fg) t.flash = false;
+    }
+
+    bool changed = next.size() != g_tasks.size() || fg != g_lastFg;
+    for (size_t i = 0; !changed && i < next.size(); ++i)
+        changed = next[i].hwnd != g_tasks[i].hwnd || next[i].title != g_tasks[i].title ||
+                  next[i].iconic != g_tasks[i].iconic || next[i].flash != g_tasks[i].flash ||
+                  next[i].visible != g_tasks[i].visible;
+    g_tasks.swap(next);
+    g_lastFg = fg;
+    return changed;
+}
+
+// ---------- text wrapping ----------
+
+static bool IsBreakAfter(wchar_t c) { return c == L'-' || c == L'/' || c == L'\\' || c == L'_' || c == L'|'; }
+
+// Wraps at spaces (or after - / \ _ |), hard-breaks words longer than a line, caps at maxLines.
+static std::vector<std::wstring> Wrap(HDC dc, const std::wstring& s, int maxW, int maxLines) {
+    std::vector<std::wstring> out;
+    size_t pos = 0, n = s.size();
+    while (pos < n && (int)out.size() < maxLines) {
+        while (pos < n && s[pos] == L' ') ++pos;
+        if (pos >= n) break;
+        int fit = 0;
+        SIZE sz;
+        GetTextExtentExPointW(dc, s.c_str() + pos, (int)(n - pos), maxW, &fit, nullptr, &sz);
+        if (fit < 1) fit = 1;
+        if ((size_t)fit >= n - pos) { out.push_back(Trim(s.substr(pos))); break; }
+
+        if ((int)out.size() == maxLines - 1) {          // last allowed line: cut it
+            std::wstring l = s.substr(pos, fit);
+            if (g_cfg.ellipsis && l.size() > 1) { l.pop_back(); l += L'…'; }
+            out.push_back(l);
+            break;
+        }
+
+        size_t end = pos + fit, next = end;
+        if (s[end] == L' ') {
+            next = end + 1;
+        } else {
+            for (size_t k = end; k > pos + 1; --k) {
+                if (s[k - 1] == L' ')          { end = k - 1; next = k; break; }
+                if (IsBreakAfter(s[k - 1]))    { end = k;     next = k; break; }
+            }
+        }
+        std::wstring l = s.substr(pos, end - pos);
+        while (!l.empty() && l.back() == L' ') l.pop_back();
+        out.push_back(l);
+        pos = next;
+    }
+    if (out.empty()) out.push_back(L"");
+    return out;
+}
+
+// ---------- drawing ----------
+
+static int ButtonHeight(int lines) {
+    return 2 + 2 * g_cfg.vpad + lines * g_lineH + (lines - 1) * g_cfg.lineGap;
+}
+
+static void DrawButton(HDC dc, RECT r, bool pressed, COLORREF border, COLORREF face, COLORREF txt,
+                       const std::vector<std::wstring>& lines) {
+    Fill(dc, r, border);                                // 1px outline
+    RECT in{r.left + 1, r.top + 1, r.right - 1, r.bottom - 1};
+    if (in.right <= in.left || in.bottom <= in.top) return;
+    Fill(dc, in, face);
+
+    int w = in.right - in.left, h = in.bottom - in.top;
+    int lx = g_cfg.highlight ? std::min(g_cfg.highlight, w) : w;
+    int ly = g_cfg.highlight ? std::min(g_cfg.highlight, h) : h;
+    if (!pressed) {                                     // raised: light from top-left
+        Fill(dc, RECT{in.left, in.top, in.left + lx, in.top + 1}, g_cfg.hi);
+        Fill(dc, RECT{in.left, in.top, in.left + 1, in.top + ly}, g_cfg.hi);
+    } else {                                            // sunken: light lands bottom-right
+        Fill(dc, RECT{in.right - lx, in.bottom - 1, in.right, in.bottom}, g_cfg.hi);
+        Fill(dc, RECT{in.right - 1, in.bottom - ly, in.right, in.bottom}, g_cfg.hi);
+    }
+
+    int shift = pressed ? 1 : 0;
+    RECT clip{in.left + 1, in.top + 1, in.right - 1, in.bottom - 1};
+    SetTextColor(dc, txt);
+    int x = in.left + g_cfg.pad + shift;
+    int y = in.top + g_cfg.vpad + shift;
+    for (auto& l : lines) {
+        ExtTextOutW(dc, x, y, ETO_CLIPPED, &clip, l.c_str(), (UINT)l.size(), nullptr);
+        y += g_lineH + g_cfg.lineGap;
+    }
+}
+
+static std::wstring ClockText() {
+    static const wchar_t* D[] = {L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat"};
+    static const wchar_t* M[] = {L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
+                                 L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec"};
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t buf[64];
+    wsprintfW(buf, L"%02d:%02d %s %d %s", st.wHour, st.wMinute, D[st.wDayOfWeek], st.wDay, M[st.wMonth - 1]);
+    return buf;
+}
+
+static int ContentHeight(const std::vector<Item>& v) {
+    if (v.empty()) return 0;
+    int h = 0;
+    for (auto& it : v) h += it.h;
+    return h + g_cfg.spacing * ((int)v.size() - 1);
+}
+
+static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, int bottom, int scroll, HWND fg) {
+    if (bottom <= top) return;
+    HRGN clip = CreateRectRgn(0, top, W, bottom);
+    SelectClipRgn(dc, clip);
+    int y = top - scroll;
+    for (auto& it : items) {
+        RECT r{0, y, W, y + it.h};
+        if (r.bottom > top && r.top < bottom) {
+            bool hov = g_hoverKind == it.kind && g_hoverIdx == it.idx;
+            if (it.kind == K_TASK) {
+                const Task& t = g_tasks[it.idx];
+                bool active = t.hwnd == fg && !t.iconic;
+                COLORREF face = t.flash ? g_cfg.flash : (active ? g_cfg.activeFace : g_cfg.face);
+                COLORREF txt = active ? g_cfg.activeText : hov ? g_cfg.hoverText : (t.iconic ? g_cfg.dim : g_cfg.text);
+                bool lit = (g_cfg.borderMode == 1 && active) || (g_cfg.borderMode == 2 && (active || t.visible));
+                DrawButton(dc, r, active, lit ? g_cfg.activeBorder : g_cfg.outline, face, txt, it.lines);
+                if (g_cfg.meter && t.level > 0.001f) {
+                    int x0 = r.left + 1, x1 = r.right - 1;
+                    int w = (int)((x1 - x0) * std::min(1.0f, t.level) + 0.5f);
+                    if (w > 0) Fill(dc, RECT{x0, r.bottom - 1 - g_cfg.meterH, x0 + w, r.bottom - 1}, g_cfg.meterColor);
+                }
+            } else {
+                DrawButton(dc, r, false, g_cfg.outline, g_cfg.pinFace, hov ? g_cfg.hoverText : g_cfg.text, it.lines);
+            }
+        }
+        g_rows.push_back(Row{r, it.kind, it.idx, top, bottom});
+        y += it.h + g_cfg.spacing;
+    }
+    SelectClipRgn(dc, nullptr);
+    DeleteObject(clip);
+}
+
+static void Paint(HWND hwnd) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(hwnd, &ps);
+    RECT cr;
+    GetClientRect(hwnd, &cr);
+    int W = cr.right, H = cr.bottom;
+
+    HDC mdc = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, W, H);
+    HGDIOBJ oldBmp = SelectObject(mdc, bmp);
+    HGDIOBJ oldFont = SelectObject(mdc, g_font);
+    SetBkMode(mdc, TRANSPARENT);
+    Fill(mdc, cr, g_cfg.bg);
+
+    TEXTMETRICW tm;
+    GetTextMetricsW(mdc, &tm);
+    g_lineH = tm.tmHeight;
+    int textW = std::max(1, W - 2 - 2 * g_cfg.pad - 1);   // -1 leaves room for the pressed shift
+
+    std::vector<Item> tasks, pins;
+    for (int i = 0; i < (int)g_tasks.size(); ++i) {
+        auto lines = Wrap(mdc, g_tasks[i].title, textW, g_cfg.maxLines);
+        tasks.push_back(Item{K_TASK, i, lines, ButtonHeight((int)lines.size())});
+    }
+    for (int i = 0; i < PinCount(); ++i) {
+        auto lines = Wrap(mdc, PinAt(i).name, textW, g_cfg.maxLines);
+        pins.push_back(Item{K_PIN, i, lines, ButtonHeight((int)lines.size())});
+    }
+
+    // Layout: [running windows ... scrolls] gap [pinned ... anchored to bottom] gap [clock]
+    int clockH = g_cfg.clock ? ButtonHeight(1) : 0;
+    int clockTop = H - clockH;
+    int bottomLimit = g_cfg.clock ? clockTop - g_cfg.gap : H;
+
+    int pinsContent = ContentHeight(pins);
+    int pinsArea = pins.empty() ? 0 : std::min(pinsContent, std::max(0, bottomLimit) * g_cfg.pinsMax / 100);
+    g_pinsBottom = bottomLimit;
+    g_pinsTop = bottomLimit - pinsArea;
+    g_tasksTop = 0;
+    g_tasksBottom = pins.empty() ? bottomLimit : g_pinsTop - g_cfg.gap;
+
+    g_scrollTasks = std::max(0, std::min(g_scrollTasks, ContentHeight(tasks) - (g_tasksBottom - g_tasksTop)));
+    g_scrollPins  = std::max(0, std::min(g_scrollPins, pinsContent - pinsArea));
+
+    g_rows.clear();
+    HWND fg = GetForegroundWindow();
+    DrawRegion(mdc, W, tasks, g_tasksTop, g_tasksBottom, g_scrollTasks, fg);
+    DrawRegion(mdc, W, pins, g_pinsTop, g_pinsBottom, g_scrollPins, fg);
+
+    if (g_cfg.clock) {
+        RECT r{0, clockTop, W, H};
+        bool hov = g_hoverKind == K_CLOCK;
+        DrawButton(mdc, r, false, g_cfg.outline, g_cfg.clockFace, hov ? g_cfg.hoverText : g_cfg.text, {ClockText()});
+        g_rows.push_back(Row{r, K_CLOCK, 0, clockTop, H});
+    }
+
+    BitBlt(hdc, 0, 0, W, H, mdc, 0, 0, SRCCOPY);
+    SelectObject(mdc, oldFont);
+    SelectObject(mdc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+    EndPaint(hwnd, &ps);
+}
+
+static const Row* HitTest(int x, int y) {
+    for (auto& r : g_rows) {
+        if (y < r.clipTop || y >= r.clipBottom) continue;
+        if (x >= r.r.left && x < r.r.right && y >= r.r.top && y < r.r.bottom) return &r;
+    }
+    return nullptr;
+}
+
+// ---------- audio meters ----------
+// Polls every active output device's sessions (WASAPI) and maps each session's peak to the
+// window buttons of the same process, or of the same exe (browsers play audio from a child process).
+
+static const GUID kCLSID_MMDeviceEnumerator  = {0xBCDE0395, 0xE52F, 0x467C, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+static const GUID kIID_IMMDeviceEnumerator   = {0xA95664D2, 0x9614, 0x4F35, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
+static const GUID kIID_IAudioSessionManager2 = {0x77AA99A0, 0x1BD6, 0x484F, {0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F}};
+static const GUID kIID_IAudioSessionControl2 = {0xBFB7FF88, 0x7239, 0x4FC9, {0x8F, 0xA2, 0x07, 0xC9, 0x50, 0xBE, 0x9C, 0x6D}};
+static const GUID kIID_IAudioMeterInformation = {0xC02216F6, 0x8C67, 0x4B5B, {0x9D, 0x00, 0xD0, 0x08, 0xE7, 0x3E, 0x00, 0x64}};
+
+// IAudioMeterInformation, declared locally because some MinGW headers only forward-declare it.
+struct IVbarMeter : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetPeakValue(float* peak) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMeteringChannelCount(UINT* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetChannelsPeakValues(UINT32 count, float* peaks) = 0;
+    virtual HRESULT STDMETHODCALLTYPE QueryHardwareSupport(DWORD* mask) = 0;
+};
+
+struct AudioSess { DWORD pid; std::wstring exe; IVbarMeter* meter; };
+static IMMDeviceEnumerator* g_mmEnum = nullptr;
+static std::vector<AudioSess> g_sessions;
+static DWORD g_sessionsAt = 0;
+
+static std::wstring PidPath(DWORD pid) {
+    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!p) return L"";
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = MAX_PATH * 2;
+    std::wstring out;
+    if (QueryFullProcessImageNameW(p, 0, buf, &n)) out.assign(buf, n);
+    CloseHandle(p);
+    return out;
+}
+
+static void AudioRelease() {
+    for (auto& a : g_sessions) if (a.meter) a.meter->Release();
+    g_sessions.clear();
+}
+
+static void AudioRefreshSessions() {
+    AudioRelease();
+    g_sessionsAt = GetTickCount();
+    if (!g_mmEnum && FAILED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL,
+                                             kIID_IMMDeviceEnumerator, (void**)&g_mmEnum))) {
+        g_mmEnum = nullptr;
+        return;
+    }
+    IMMDeviceCollection* coll = nullptr;
+    if (FAILED(g_mmEnum->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) || !coll) return;
+    UINT nDev = 0;
+    coll->GetCount(&nDev);
+    for (UINT d = 0; d < nDev; ++d) {
+        IMMDevice* dev = nullptr;
+        if (FAILED(coll->Item(d, &dev)) || !dev) continue;
+        IAudioSessionManager2* mgr = nullptr;
+        if (SUCCEEDED(dev->Activate(kIID_IAudioSessionManager2, CLSCTX_ALL, nullptr, (void**)&mgr)) && mgr) {
+            IAudioSessionEnumerator* en = nullptr;
+            if (SUCCEEDED(mgr->GetSessionEnumerator(&en)) && en) {
+                int count = 0;
+                en->GetCount(&count);
+                for (int j = 0; j < count; ++j) {
+                    IAudioSessionControl* ctl = nullptr;
+                    if (FAILED(en->GetSession(j, &ctl)) || !ctl) continue;
+                    IAudioSessionControl2* ctl2 = nullptr;
+                    DWORD pid = 0;
+                    if (SUCCEEDED(ctl->QueryInterface(kIID_IAudioSessionControl2, (void**)&ctl2)) && ctl2) {
+                        if (ctl2->GetProcessId(&pid) != S_OK) pid = 0;   // skip system sounds / multi-process
+                        ctl2->Release();
+                    }
+                    IVbarMeter* m = nullptr;
+                    if (pid && SUCCEEDED(ctl->QueryInterface(kIID_IAudioMeterInformation, (void**)&m)) && m)
+                        g_sessions.push_back(AudioSess{pid, PidPath(pid), m});
+                    ctl->Release();
+                }
+                en->Release();
+            }
+            mgr->Release();
+        }
+        dev->Release();
+    }
+    coll->Release();
+}
+
+static float ToDisplay(float peak) {
+    if (peak <= 0.0f) return 0.0f;
+    if (g_cfg.meterDb <= 0) return std::min(1.0f, peak);
+    float db = 20.0f * std::log10(peak);
+    return std::max(0.0f, std::min(1.0f, 1.0f + db / (float)g_cfg.meterDb));
+}
+
+// Returns true if any button's bar changed enough to repaint.
+static bool AudioTick() {
+    if (g_sessions.empty() || GetTickCount() - g_sessionsAt > 1000) AudioRefreshSessions();
+
+    std::vector<std::pair<AudioSess*, float>> peaks;
+    for (auto& a : g_sessions) {
+        float p = 0;
+        if (SUCCEEDED(a.meter->GetPeakValue(&p)) && p > 0) peaks.push_back({&a, p});
+    }
+
+    const float fall = g_cfg.meterFall / 100.0f;
+    bool changed = false;
+    for (auto& t : g_tasks) {
+        float target = 0;
+        for (auto& pk : peaks) {
+            const AudioSess& a = *pk.first;
+            bool direct = a.pid == t.pid;
+            bool sameExe = !direct && !t.exe.empty() && _wcsicmp(a.exe.c_str(), t.exe.c_str()) == 0 &&
+                           std::none_of(g_tasks.begin(), g_tasks.end(), [&](const Task& o) { return o.pid == a.pid; });
+            if (direct || sameExe) target = std::max(target, ToDisplay(pk.second));
+        }
+        float next = std::max(target, t.level - fall);
+        if (next < 0.001f) next = 0;
+        if (std::fabs(next - t.level) > 0.002f) changed = true;
+        t.level = next;
+    }
+    return changed;
+}
+
+static void StartMeterTimer() {
+    KillTimer(g_hwnd, TIMER_METER);
+    if (g_cfg.meter) SetTimer(g_hwnd, TIMER_METER, 1000 / g_cfg.meterFps, nullptr);
+    else for (auto& t : g_tasks) t.level = 0;
+}
+
+// ---------- actions ----------
+
+// Brings h to the front without SwitchToThisWindow's slow animated path.
+static void ForceForeground(HWND h) {
+    if (SetForegroundWindow(h)) return;
+    HWND fg = GetForegroundWindow();
+    DWORD me = GetCurrentThreadId();
+    DWORD fgThread = fg ? GetWindowThreadProcessId(fg, nullptr) : 0;
+    bool attached = fgThread && fgThread != me && AttachThreadInput(me, fgThread, TRUE);
+    BringWindowToTop(h);
+    SetForegroundWindow(h);
+    if (attached) AttachThreadInput(me, fgThread, FALSE);
+}
+
+static void ActivateOrMinimize(HWND h) {
+    if (!IsWindow(h)) return;
+    if (IsIconic(h)) {
+        ShowWindowAsync(h, SW_RESTORE);
+        ForceForeground(h);
+    } else if (GetForegroundWindow() == h) {
+        ShowWindowAsync(h, SW_MINIMIZE);
+    } else {
+        ForceForeground(h);
+    }
+}
+
+static void LaunchPin(const Pin& p) {
+    if (!p.aumid.empty()) {
+        std::wstring target = L"shell:AppsFolder\\" + p.aumid;
+        ShellExecuteW(nullptr, L"open", target.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    std::wstring path = ExpandEnv(p.path), args = ExpandEnv(p.args), dir = ExpandEnv(p.dir);
+    ShellExecuteW(nullptr, L"open", path.c_str(), args.empty() ? nullptr : args.c_str(),
+                  dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+}
+
+static void Reload() {
+    LoadConfig();
+    CreateBarFont();
+    ShowSystemTaskbars(!g_cfg.hideTaskbar);
+    AppBarSetPos();
+    RefreshTasks();
+    RequestStartPins();
+    StartMeterTimer();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Sets key=value in vbar.ini in place (first uncommented match), or appends it.
+static void SetIniValue(const std::wstring& key, const std::wstring& value) {
+    std::wstring text = DecodeText(ReadFileBytes(g_iniPath));
+    std::wstring out, line;
+    bool done = false;
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t nl = text.find(L'\n', start);
+        line = text.substr(start, nl == std::wstring::npos ? std::wstring::npos : nl - start);
+        std::wstring t = Trim(line);
+        size_t eq = t.find(L'=');
+        if (!done && !t.empty() && t[0] != L';' && t[0] != L'#' && eq != std::wstring::npos &&
+            _wcsicmp(Trim(t.substr(0, eq)).c_str(), key.c_str()) == 0) {
+            bool cr = !line.empty() && line.back() == L'\r';
+            line = key + L"=" + value + (cr ? L"\r" : L"");
+            done = true;
+        }
+        out += line;
+        if (nl == std::wstring::npos) break;
+        out += L'\n';
+        start = nl + 1;
+    }
+    if (!done) {
+        if (!out.empty() && out.back() != L'\n') out += L"\r\n";
+        out += key + L"=" + value + L"\r\n";
+    }
+    std::ofstream o(g_iniPath.c_str(), std::ios::binary);
+    o << WToUtf8(out);
+}
+
+static void ShowMenu(POINT screenPt) {
+    HMENU m = CreatePopupMenu();
+
+    HMENU screens = CreatePopupMenu();
+    AppendMenuW(screens, MF_STRING | (g_cfg.monitor == 0 ? MF_CHECKED : 0), IDM_MON_PRIMARY, L"Primary");
+    auto mons = Monitors();
+    for (size_t i = 0; i < mons.size() && i < 16; ++i) {
+        wchar_t label[96];
+        wsprintfW(label, L"Display %d  (%dx%d)%s", mons[i].num,
+                  mons[i].rc.right - mons[i].rc.left, mons[i].rc.bottom - mons[i].rc.top,
+                  mons[i].primary ? L"  primary" : L"");
+        AppendMenuW(screens, MF_STRING | (g_cfg.monitor == mons[i].num ? MF_CHECKED : 0),
+                    IDM_MON_BASE + i, label);
+    }
+    AppendMenuW(screens, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(screens, MF_STRING | (!g_cfg.rightSide ? MF_CHECKED : 0), IDM_SIDE_LEFT, L"Left edge");
+    AppendMenuW(screens, MF_STRING | (g_cfg.rightSide ? MF_CHECKED : 0), IDM_SIDE_RIGHT, L"Right edge");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)screens, L"Position");
+
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_RELOAD, L"Reload config + Start pins");
+    AppendMenuW(m, MF_STRING, IDM_EDIT, L"Edit config");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit vbar");
+    SetForegroundWindow(g_hwnd);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, g_hwnd, nullptr);
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);
+    DestroyMenu(m);
+    if (cmd == IDM_SIDE_LEFT || cmd == IDM_SIDE_RIGHT) {
+        SetIniValue(L"side", cmd == IDM_SIDE_RIGHT ? L"right" : L"left");
+        Reload();
+    } else if (cmd == IDM_MON_PRIMARY) {
+        SetIniValue(L"monitor", L"primary");
+        Reload();
+    } else if (cmd >= IDM_MON_BASE && cmd < IDM_MON_BASE + 16 && cmd - IDM_MON_BASE < (int)mons.size()) {
+        SetIniValue(L"monitor", std::to_wstring(mons[cmd - IDM_MON_BASE].num));
+        Reload();
+    }
+    else if (cmd == IDM_RELOAD) Reload();
+    else if (cmd == IDM_EDIT) ShellExecuteW(nullptr, L"open", g_iniPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    else if (cmd == IDM_EXIT) DestroyWindow(g_hwnd);
+}
+
+static void Activate(HWND h) {
+    if (!IsWindow(h)) return;
+    if (IsIconic(h)) ShowWindowAsync(h, SW_RESTORE);
+    ForceForeground(h);
+}
+
+// Raise the hovered window right away. Skips work when it's already in front.
+static void HoverRaise(int idx) {
+    if (idx < 0 || idx >= (int)g_tasks.size()) return;
+    HWND h = g_tasks[idx].hwnd;
+    if (!IsWindow(h) || GetForegroundWindow() == h) return;
+    if (IsIconic(h) && !g_cfg.hoverRestore) return;
+    Activate(h);
+}
+
+static int TrackMenu(HMENU m, POINT screenPt) {
+    KillTimer(g_hwnd, TIMER_HOVER);
+    SetForegroundWindow(g_hwnd);                  // required so the menu closes when you click away
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, g_hwnd, nullptr);
+    PostMessageW(g_hwnd, WM_NULL, 0, 0);
+    DestroyMenu(m);
+    return cmd;
+}
+
+static void ShowTaskMenu(HWND h, POINT screenPt) {
+    if (!IsWindow(h)) return;
+    bool iconic = IsIconic(h) != 0, zoomed = IsZoomed(h) != 0;
+    std::wstring exe = ProcessPath(h);
+    UINT noExe = exe.empty() ? MF_GRAYED : 0;
+
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_T_SWITCH, L"Switch to");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | ((iconic || zoomed) ? 0 : MF_GRAYED), IDM_T_RESTORE, L"Restore");
+    AppendMenuW(m, MF_STRING | (iconic ? MF_GRAYED : 0), IDM_T_MINIMIZE, L"Minimize");
+    AppendMenuW(m, MF_STRING | (zoomed ? MF_GRAYED : 0), IDM_T_MAXIMIZE, L"Maximize");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | noExe, IDM_T_NEW, L"New instance");
+    AppendMenuW(m, MF_STRING | noExe, IDM_T_LOCATION, L"Open file location");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_T_CLOSE, L"Close window");
+    AppendMenuW(m, MF_STRING, IDM_T_KILL, L"End process");
+    SetMenuDefaultItem(m, IDM_T_SWITCH, FALSE);
+
+    switch (TrackMenu(m, screenPt)) {
+    case IDM_T_SWITCH:   Activate(h); break;
+    case IDM_T_RESTORE:  ShowWindowAsync(h, SW_RESTORE); Activate(h); break;
+    case IDM_T_MINIMIZE: ShowWindowAsync(h, SW_MINIMIZE); break;
+    case IDM_T_MAXIMIZE: ShowWindowAsync(h, SW_MAXIMIZE); Activate(h); break;
+    case IDM_T_NEW:      ShellExecuteW(nullptr, L"open", exe.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+    case IDM_T_LOCATION: OpenLocation(exe); break;
+    case IDM_T_CLOSE:    PostMessageW(h, WM_CLOSE, 0, 0); break;
+    case IDM_T_KILL: {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (HANDLE p = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) { TerminateProcess(p, 1); CloseHandle(p); }
+        break;
+    }
+    }
+    RefreshTasks();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+static void ShowPinMenu(int idx, POINT screenPt) {
+    if (idx < 0 || idx >= PinCount()) return;
+    Pin p = PinAt(idx);                           // copy: the list can change while the menu is open
+    UINT noPath = p.aumid.empty() ? 0 : MF_GRAYED;
+
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, IDM_P_OPEN, L"Open");
+    AppendMenuW(m, MF_STRING | noPath, IDM_P_ADMIN, L"Run as administrator");
+    AppendMenuW(m, MF_STRING | noPath, IDM_P_LOCATION, L"Open file location");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_EDIT, L"Edit config");
+    SetMenuDefaultItem(m, IDM_P_OPEN, FALSE);
+
+    switch (TrackMenu(m, screenPt)) {
+    case IDM_P_OPEN: LaunchPin(p); break;
+    case IDM_P_ADMIN: {
+        std::wstring path = ExpandEnv(p.path), args = ExpandEnv(p.args), dir = ExpandEnv(p.dir);
+        ShellExecuteW(nullptr, L"runas", path.c_str(), args.empty() ? nullptr : args.c_str(),
+                      dir.empty() ? nullptr : dir.c_str(), SW_SHOWNORMAL);
+        break;
+    }
+    case IDM_P_LOCATION: OpenLocation(Resolve(p.path)); break;
+    case IDM_EDIT: ShellExecuteW(nullptr, L"open", g_iniPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
+    }
+}
+
+// ---------- window proc ----------
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == g_shellMsg && g_shellMsg) {
+        HWND h = (HWND)lp;
+        if (wp == HSHELL_FLASH) {
+            for (auto& t : g_tasks) if (t.hwnd == h) t.flash = true;
+        } else if ((wp & 0x7FFF) == HSHELL_WINDOWACTIVATED) {
+            for (auto& t : g_tasks) if (t.hwnd == h) t.flash = false;
+        }
+        RefreshTasks();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    if (msg == g_taskbarCreatedMsg && g_taskbarCreatedMsg) {     // explorer restarted
+        AppBarRemove();
+        AppBarRegister();
+        ShowSystemTaskbars(!g_cfg.hideTaskbar);
+        return 0;
+    }
+
+    switch (msg) {
+    case WM_STARTPINS: {
+        StartPinsResult* res = (StartPinsResult*)lp;
+        if (res->gen == g_startPinsGen && g_cfg.startPins) {
+            g_startPins.clear();
+            for (auto& p : res->pins) {
+                bool dup = std::any_of(g_cfg.pins.begin(), g_cfg.pins.end(), [&](const Pin& c) {
+                    return _wcsicmp(c.name.c_str(), p.name.c_str()) == 0;
+                });
+                if (!dup) g_startPins.push_back(p);
+            }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        delete res;
+        return 0;
+    }
+
+    case WM_APPBAR:
+        if (wp == ABN_POSCHANGED) AppBarSetPos();
+        else if (wp == ABN_FULLSCREENAPP)
+            SetWindowPos(hwnd, lp ? HWND_BOTTOM : HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        return 0;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_TIMER:
+        if (wp == TIMER_SCAN) {
+            if (RefreshTasks()) InvalidateRect(hwnd, nullptr, FALSE);
+            if (g_cfg.hideTaskbar) {
+                HWND t = FindWindowW(L"Shell_TrayWnd", nullptr);
+                if (t && IsWindowVisible(t)) ShowSystemTaskbars(false);
+            }
+        } else if (wp == TIMER_HOVER) {
+            KillTimer(hwnd, TIMER_HOVER);
+            if (g_hoverKind == K_TASK) HoverRaise(g_hoverIdx);
+        } else if (wp == TIMER_METER) {
+            if (AudioTick()) InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (wp == TIMER_CLOCK && g_cfg.clock) {
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            if (st.wMinute != g_lastMinute) {
+                g_lastMinute = st.wMinute;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+        }
+        return 0;
+
+    case WM_MOUSEMOVE: {
+        if (!g_tracking) {
+            TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
+            TrackMouseEvent(&tme);
+            g_tracking = true;
+        }
+        const Row* r = HitTest((short)LOWORD(lp), (short)HIWORD(lp));
+        int k = r ? r->kind : K_NONE, i = r ? r->idx : -1;
+        if (k != g_hoverKind || i != g_hoverIdx) {
+            g_hoverKind = k;
+            g_hoverIdx = i;
+            KillTimer(hwnd, TIMER_HOVER);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            if (k == K_TASK && g_cfg.hoverFocus) {
+                if (g_cfg.hoverDelay == 0) HoverRaise(i);
+                else SetTimer(hwnd, TIMER_HOVER, g_cfg.hoverDelay, nullptr);
+            }
+        }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        KillTimer(hwnd, TIMER_HOVER);
+        g_tracking = false;
+        g_hoverKind = K_NONE;
+        g_hoverIdx = -1;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+
+    case WM_MOUSEWHEEL: {
+        POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};       // screen coords
+        ScreenToClient(hwnd, &pt);
+        int delta = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * (g_lineH + g_cfg.vpad) * 3;
+        if (pt.y >= g_pinsTop && pt.y < g_pinsBottom) g_scrollPins -= delta;
+        else g_scrollTasks -= delta;
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        KillTimer(hwnd, TIMER_HOVER);                 // a click wins over a pending hover-raise
+        const Row* r = HitTest((short)LOWORD(lp), (short)HIWORD(lp));
+        if (!r) return 0;
+        if (r->kind == K_PIN && r->idx < PinCount()) LaunchPin(PinAt(r->idx));
+        else if (r->kind == K_TASK && r->idx < (int)g_tasks.size()) ActivateOrMinimize(g_tasks[r->idx].hwnd);
+        RefreshTasks();
+        InvalidateRect(hwnd, nullptr, FALSE);
+        return 0;
+    }
+    case WM_MBUTTONUP: {
+        const Row* r = HitTest((short)LOWORD(lp), (short)HIWORD(lp));
+        if (r && r->kind == K_TASK && r->idx < (int)g_tasks.size())
+            PostMessageW(g_tasks[r->idx].hwnd, WM_CLOSE, 0, 0);
+        return 0;
+    }
+    case WM_RBUTTONUP: {
+        POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
+        const Row* r = HitTest(pt.x, pt.y);
+        int kind = r ? r->kind : K_NONE, idx = r ? r->idx : -1;
+        ClientToScreen(hwnd, &pt);
+        if (kind == K_PIN && idx < PinCount()) ShowPinMenu(idx, pt);
+        else if (kind == K_TASK && idx < (int)g_tasks.size()) ShowTaskMenu(g_tasks[idx].hwnd, pt);
+        else ShowMenu(pt);
+        return 0;
+    }
+
+    case WM_DISPLAYCHANGE:
+        AppBarSetPos();
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        Paint(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, TIMER_SCAN);
+        KillTimer(hwnd, TIMER_CLOCK);
+        KillTimer(hwnd, TIMER_HOVER);
+        KillTimer(hwnd, TIMER_METER);
+        AudioRelease();
+        if (g_mmEnum) { g_mmEnum->Release(); g_mmEnum = nullptr; }
+        DeregisterShellHookWindow(hwnd);
+        AppBarRemove();
+        ShowSystemTaskbars(true);
+        if (!g_loadedFontFile.empty()) RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
+        if (g_font) DeleteObject(g_font);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// ---------- entry ----------
+
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    HANDLE mutex = CreateMutexW(nullptr, TRUE, L"vbar_single_instance");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+
+    wchar_t exe[MAX_PATH];
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    g_exeDir = exe;
+    g_exeDir = g_exeDir.substr(0, g_exeDir.find_last_of(L"\\/"));
+    g_iniPath = g_exeDir + L"\\vbar.ini";
+
+    LoadConfig();
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = L"VBarWnd";
+    RegisterClassExW(&wc);
+
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, L"VBarWnd", L"vbar",
+                             WS_POPUP, 0, 0, g_cfg.width, 100, nullptr, nullptr, hInst, nullptr);
+    if (!g_hwnd) return 1;
+
+    CreateBarFont();
+    g_shellMsg = RegisterWindowMessageW(L"SHELLHOOK");
+    g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
+    RegisterShellHookWindow(g_hwnd);
+    AppBarRegister();
+    if (g_cfg.hideTaskbar) ShowSystemTaskbars(false);
+    RefreshTasks();
+    RequestStartPins();
+
+    SetTimer(g_hwnd, TIMER_SCAN, 500, nullptr);
+    SetTimer(g_hwnd, TIMER_CLOCK, 1000, nullptr);
+    StartMeterTimer();
+    ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    UpdateWindow(g_hwnd);
+
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+        TranslateMessage(&m);
+        DispatchMessageW(&m);
+    }
+    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
+    CoUninitialize();
+    return 0;
+}
