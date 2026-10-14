@@ -48,6 +48,7 @@
 #define TIMER_SCAN 2
 #define TIMER_HOVER 3
 #define TIMER_METER 4
+#define TIMER_BLINK 5
 #define IDM_RELOAD 100
 #define IDM_EDIT 101
 #define IDM_EXIT 102
@@ -92,6 +93,9 @@ struct Config {
              outline = RGB(0, 0, 0), hoverText = RGB(255, 255, 255), activeText = RGB(255, 255, 255),
              activeFace = RGB(64, 64, 64), pinFace = RGB(64, 64, 64), clockFace = RGB(64, 64, 64),
              activeBorder = RGB(255, 255, 255), meterColor = RGB(47, 125, 255);
+    COLORREF flashColor = RGB(47, 125, 255);
+    bool flashColorSet = false;
+    int hoverBright = 28, flashRate = 500, flashCount = 8;
     bool activeFaceSet = false, pinFaceSet = false, clockFaceSet = false;
     std::vector<std::wstring> strip;
     std::vector<Pin> pins;
@@ -100,6 +104,8 @@ struct Config {
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
 static HFONT g_font = nullptr, g_clockFont = nullptr;
+static bool g_blinkOn = true;
+static int g_blinkTicks = 0;
 static std::wstring g_exeDir, g_iniPath, g_loadedFontFile;
 static std::vector<Task> g_tasks;
 static std::vector<Pin> g_startPins;
@@ -469,10 +475,15 @@ static const char* kDefaultIni =
 "; text: normal, hovered, focused window, minimized window\n"
 "text=#D8D8D8\n"
 "hovertext=#FFFFFF\n"
+"; how much a hovered button's face brightens (added to each RGB channel; 0 = off)\n"
+"hoverbright=28\n"
 "activetext=#FFFFFF\n"
 "dim=#888888\n"
-"; face of a window asking for attention\n"
-"flash=#6E6E6E\n"
+"; a window asking for attention blinks this colour (leave out to match metercolor)\n"
+";flash=#2F7DFF\n"
+"; blink speed in ms, and how many blinks before it stays lit until you focus the window (0 = stay lit)\n"
+"flashrate=500\n"
+"flashcount=8\n"
 "\n"
 "; suffixes trimmed from window titles\n"
 "strip=- Google Chrome\n"
@@ -572,7 +583,10 @@ static void LoadConfig() {
         else if (k == L"text")        g_cfg.text = ParseColor(v, g_cfg.text);
         else if (k == L"hi")          g_cfg.hi = ParseColor(v, g_cfg.hi);
         else if (k == L"dim")         g_cfg.dim = ParseColor(v, g_cfg.dim);
-        else if (k == L"flash")       g_cfg.flash = ParseColor(v, g_cfg.flash);
+        else if (k == L"flash")       { g_cfg.flashColor = ParseColor(v, g_cfg.flashColor); g_cfg.flashColorSet = true; }
+        else if (k == L"flashrate")   g_cfg.flashRate = std::max(100, n);
+        else if (k == L"flashcount")  g_cfg.flashCount = std::max(0, n);
+        else if (k == L"hoverbright") g_cfg.hoverBright = std::max(-255, std::min(255, n));
         else if (k == L"strip")       { if (!v.empty()) g_cfg.strip.push_back(v); }
         else if (k == L"pindir")      g_cfg.pinDir = v;
         else if (k == L"pin") {
@@ -587,6 +601,7 @@ static void LoadConfig() {
     }
 
     if (!g_cfg.startColorSet) g_cfg.startColor = g_cfg.text;
+    if (!g_cfg.flashColorSet) g_cfg.flashColor = g_cfg.meterColor;
     if (!g_cfg.activeFaceSet) g_cfg.activeFace = g_cfg.face;
     if (!g_cfg.pinFaceSet)    g_cfg.pinFace = g_cfg.face;
     if (!g_cfg.clockFaceSet)  g_cfg.clockFace = g_cfg.face;
@@ -896,6 +911,13 @@ static int ContentHeight(const std::vector<Item>& v) {
     return h + g_cfg.spacing * ((int)v.size() - 1);
 }
 
+static COLORREF Brighten(COLORREF c, int d) {
+    auto ch = [d](int v) { return std::max(0, std::min(255, v + d)); };
+    return RGB(ch(GetRValue(c)), ch(GetGValue(c)), ch(GetBValue(c)));
+}
+
+static COLORREF HoverFace(COLORREF face, bool hov) { return hov ? Brighten(face, g_cfg.hoverBright) : face; }
+
 static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, int bottom, int scroll, HWND fg) {
     if (bottom <= top) return;
     HRGN clip = CreateRectRgn(0, top, W, bottom);
@@ -908,8 +930,9 @@ static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, i
             if (it.kind == K_TASK) {
                 const Task& t = g_tasks[it.idx];
                 bool active = t.hwnd == fg && !t.iconic;
-                COLORREF face = t.flash ? g_cfg.flash : (active ? g_cfg.activeFace : g_cfg.face);
-                COLORREF txt = active ? g_cfg.activeText : hov ? g_cfg.hoverText : (t.iconic ? g_cfg.dim : g_cfg.text);
+                bool blink = t.flash && g_blinkOn;
+                COLORREF face = HoverFace(blink ? g_cfg.flashColor : (active ? g_cfg.activeFace : g_cfg.face), hov);
+                COLORREF txt = (active || blink) ? g_cfg.activeText : hov ? g_cfg.hoverText : (t.iconic ? g_cfg.dim : g_cfg.text);
                 bool lit = (g_cfg.borderMode == 1 && active) || (g_cfg.borderMode == 2 && (active || t.visible));
                 DrawButton(dc, r, active, lit ? g_cfg.activeBorder : g_cfg.outline, face, txt, it.lines);
                 if (g_cfg.meter && t.level > 0.001f) {
@@ -918,7 +941,7 @@ static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, i
                     if (w > 0) Fill(dc, RECT{x0, r.bottom - 1 - g_cfg.meterH, x0 + w, r.bottom - 1}, g_cfg.meterColor);
                 }
             } else {
-                DrawButton(dc, r, false, g_cfg.outline, g_cfg.pinFace, hov ? g_cfg.hoverText : g_cfg.text, it.lines);
+                DrawButton(dc, r, false, g_cfg.outline, HoverFace(g_cfg.pinFace, hov), hov ? g_cfg.hoverText : g_cfg.text, it.lines);
             }
         }
         g_rows.push_back(Row{r, it.kind, it.idx, top, bottom});
@@ -1019,7 +1042,7 @@ static void Paint(HWND hwnd) {
         SelectObject(mdc, g_clockFont);
         int saved = g_lineH;
         g_lineH = clockLineH;
-        DrawButton(mdc, r, false, g_cfg.outline, g_cfg.clockFace, hov ? g_cfg.hoverText : g_cfg.text, clockLines);
+        DrawButton(mdc, r, false, g_cfg.outline, HoverFace(g_cfg.clockFace, hov), hov ? g_cfg.hoverText : g_cfg.text, clockLines);
         g_lineH = saved;
         SelectObject(mdc, g_font);
         g_rows.push_back(Row{r, K_CLOCK, 0, r.top, r.bottom});
@@ -1027,7 +1050,7 @@ static void Paint(HWND hwnd) {
     if (g_cfg.startButton) {
         RECT r{0, startTop, W, H};
         bool hov = g_hoverKind == K_START;
-        DrawStartButton(mdc, r, g_cfg.outline, g_cfg.clockFace, hov ? g_cfg.hoverText : g_cfg.startColor);
+        DrawStartButton(mdc, r, g_cfg.outline, HoverFace(g_cfg.clockFace, hov), hov ? g_cfg.hoverText : g_cfg.startColor);
         g_rows.push_back(Row{r, K_START, 0, startTop, H});
     }
 
@@ -1164,6 +1187,17 @@ static bool AudioTick() {
         t.level = next;
     }
     return changed;
+}
+
+// Blink timer runs only while some window is asking for attention.
+static void UpdateBlinkTimer(bool restart) {
+    bool any = std::any_of(g_tasks.begin(), g_tasks.end(), [](const Task& t) { return t.flash; });
+    if (!any) { KillTimer(g_hwnd, TIMER_BLINK); g_blinkOn = true; g_blinkTicks = 0; return; }
+    if (restart) {
+        g_blinkOn = true;
+        g_blinkTicks = 0;
+        SetTimer(g_hwnd, TIMER_BLINK, g_cfg.flashRate, nullptr);
+    }
 }
 
 static void StartMeterTimer() {
@@ -1398,12 +1432,14 @@ static void ShowPinMenu(int idx, POINT screenPt) {
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == g_shellMsg && g_shellMsg) {
         HWND h = (HWND)lp;
+        bool newFlash = false;
         if (wp == HSHELL_FLASH) {
-            for (auto& t : g_tasks) if (t.hwnd == h) t.flash = true;
+            for (auto& t : g_tasks) if (t.hwnd == h && !t.flash) { t.flash = true; newFlash = true; }
         } else if ((wp & 0x7FFF) == HSHELL_WINDOWACTIVATED) {
             for (auto& t : g_tasks) if (t.hwnd == h) t.flash = false;
         }
         RefreshTasks();
+        UpdateBlinkTimer(newFlash);
         InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
@@ -1444,6 +1480,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == TIMER_SCAN) {
             if (RefreshTasks()) InvalidateRect(hwnd, nullptr, FALSE);
+            UpdateBlinkTimer(false);
             if (g_cfg.hideTaskbar) {
                 HWND t = FindWindowW(L"Shell_TrayWnd", nullptr);
                 if (t && IsWindowVisible(t)) ShowSystemTaskbars(false);
@@ -1451,6 +1488,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         } else if (wp == TIMER_HOVER) {
             KillTimer(hwnd, TIMER_HOVER);
             if (g_hoverKind == K_TASK) HoverRaise(g_hoverIdx);
+        } else if (wp == TIMER_BLINK) {
+            UpdateBlinkTimer(false);
+            if (std::any_of(g_tasks.begin(), g_tasks.end(), [](const Task& t) { return t.flash; })) {
+                ++g_blinkTicks;
+                if (g_cfg.flashCount > 0 && g_blinkTicks >= g_cfg.flashCount * 2) {
+                    g_blinkOn = true;                    // done blinking: stay lit until focused
+                    KillTimer(hwnd, TIMER_BLINK);
+                } else {
+                    g_blinkOn = g_cfg.flashCount == 0 ? true : !g_blinkOn;
+                }
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
         } else if (wp == TIMER_METER) {
             if (AudioTick()) InvalidateRect(hwnd, nullptr, FALSE);
         } else if (wp == TIMER_CLOCK && g_cfg.clock) {
@@ -1545,6 +1594,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, TIMER_CLOCK);
         KillTimer(hwnd, TIMER_HOVER);
         KillTimer(hwnd, TIMER_METER);
+        KillTimer(hwnd, TIMER_BLINK);
         AudioRelease();
         if (g_mmEnum) { g_mmEnum->Release(); g_mmEnum = nullptr; }
         DeregisterShellHookWindow(hwnd);

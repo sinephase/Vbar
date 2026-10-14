@@ -4,7 +4,8 @@ Vertical minimalist task bar for Windows 11 (also runs on Windows 10): a text-on
 
 - **Running windows** at the top, **pinned apps** (your own + your Windows Start menu pins) below, then a **clock** and a `░▒▓█` **start button** at the very bottom
 - **Word-wrapped** titles, so long names stay readable instead of truncating
-- **Focused window** drawn pressed with a white border; minimized windows dimmed; windows asking for attention highlighted
+- **Focused window** drawn pressed with a white border; minimized windows dimmed; buttons brighten on hover
+- **Attention flashing** — a window asking for attention (like a new message) blinks blue, then stays lit until you focus it
 - **Hover to focus** — resting on a button brings that window to the front instantly
 - **Per-app audio meter** — a thin blue bar under any app that's playing sound, tracking its output level
 - **Right-click menus** — restore / minimize / maximize / close / end process / open file location / run as admin
@@ -39,7 +40,9 @@ Edit `vbar.ini` (right-click the clock → **Edit config**), then right-click �
 
 **Font:** `font`, `fontsize`, `bold`, `fontweight` (100–900), `italic`, `aa` (0 = crisp, 1 = ClearType), `fontfile` (a .ttf/.fon next to the exe, loaded privately — e.g. Terminus)
 
-**Colours:** `bg`, `outline`, `hi`, `face`, `activeface`, `pinface`, `clockface`, `text`, `hovertext`, `activetext`, `dim`, `flash`, `activeborder`
+**Colours:** `bg`, `outline`, `hi`, `face`, `activeface`, `pinface`, `clockface`, `text`, `hovertext`, `activetext`, `dim`, `activeborder`, `hoverbright` (face brightening on hover, 0 = off)
+
+**Attention flash:** `flash` (colour, defaults to `metercolor`), `flashrate` (ms per blink), `flashcount` (blinks before staying lit, 0 = solid)
 
 **Behaviour:** `bordermode` (`focused` / `visible` / `off`), `hoverfocus`, `hoverdelay` (ms, 0 = instant), `hoverrestore`, `hidetaskbar`
 
