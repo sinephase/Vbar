@@ -18,7 +18,7 @@ Vertical minimalist task bar for Windows 11 (also runs on Windows 10). Every run
 
 ## Usage
 
-1. Download `vbar.exe` from [Releases](../../releases) and put it in its own folder.
+1. Download [`bin/vbar.exe`](bin/vbar.exe) (click it, then **Download raw file**) and put it in its own folder.
 2. Run it. It writes `vbar.ini` next to itself on first launch.
 3. To start it with Windows, put a shortcut to `vbar.exe` in `shell:startup`.
 
