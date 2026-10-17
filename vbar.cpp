@@ -5,7 +5,7 @@
 // Build (MSVC, x64 Native Tools prompt):
 //   cl /O2 /EHsc /DUNICODE /D_UNICODE vbar.cpp /link /SUBSYSTEM:WINDOWS
 // Build (MinGW-w64):
-//   g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid
+//   g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32
 //
 // First run writes vbar.ini next to the exe. Edit it, then right-click the clock > Reload.
 
@@ -31,6 +31,9 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <map>
+#include <memory>
+#include <cstdint>
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 
@@ -40,6 +43,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "msimg32.lib")
 #endif
 
 #define WM_APPBAR    (WM_APP + 1)
@@ -70,9 +74,14 @@
 
 enum Kind { K_PIN = 0, K_TASK = 1, K_CLOCK = 2, K_START = 3, K_NONE = -1 };
 
+// A 2-bit icon: every pixel is transparent or one of three grey shades, stored ready to AlphaBlend.
+struct Icon2 { HBITMAP bmp = nullptr; int size = 0; ~Icon2() { if (bmp) DeleteObject(bmp); } };
+typedef std::shared_ptr<Icon2> IconPtr;
+
 struct Pin  { std::wstring name, path, args, dir, aumid; };
 struct Task { HWND hwnd; std::wstring title; bool flash; bool iconic; bool visible;
-              DWORD pid = 0; std::wstring exe; float level = 0; };
+              DWORD pid = 0; std::wstring exe; float level = 0;
+              IconPtr icon; int iconTries = 0; bool iconFinal = false; DWORD iconNext = 0; };
 struct Row  { RECT r; int kind; int idx; int clipTop; int clipBottom; };
 struct Item { int kind; int idx; std::vector<std::wstring> lines; int h; };
 
@@ -96,6 +105,11 @@ struct Config {
     COLORREF flashColor = RGB(47, 125, 255);
     bool flashColorSet = false;
     int hoverBright = 28, flashRate = 500, flashCount = 8;
+    bool icons = true, iconDither = true;
+    int iconSize = 0, iconPad = 3, scrollW = 2;
+    COLORREF iconShade[3] = {RGB(0, 0, 0), RGB(140, 140, 140), RGB(232, 232, 232)};
+    COLORREF scrollColor = RGB(47, 125, 255);
+    bool scrollColorSet = false;
     bool activeFaceSet = false, pinFaceSet = false, clockFaceSet = false;
     std::vector<std::wstring> strip;
     std::vector<Pin> pins;
@@ -118,6 +132,9 @@ static UINT g_shellMsg = 0, g_taskbarCreatedMsg = 0;
 static HWND g_lastFg = nullptr;
 static int g_lastMinute = -1;
 static LONG g_startPinsGen = 0;
+static std::map<std::wstring, IconPtr> g_pinIcons;
+static HDC g_iconDC = nullptr;
+static int g_iconS = 0, g_indent = 0;
 
 // ---------- helpers ----------
 
@@ -438,6 +455,22 @@ static const char* kDefaultIni =
 "; 1 = hovering also restores minimized windows\n"
 "hoverrestore=0\n"
 "\n"
+"; ---- icons: each app's real icon reduced to 2 bits (transparent + 3 grey shades) ----\n"
+"icons=1\n"
+"; icon size in px (0 = same as the text line height)\n"
+"iconsize=0\n"
+"; space between icon and text\n"
+"iconpad=3\n"
+"; 1 = ordered dither between shades (retro look), 0 = hard steps\n"
+"icondither=1\n"
+"; the three shades, darkest to lightest\n"
+"iconshades=#000000,#8C8C8C,#E8E8E8\n"
+"\n"
+"; ---- scroll indicator on the inner edge of any section that scrolls ----\n"
+"; width in px (0 = off); colour defaults to metercolor\n"
+"scrollw=2\n"
+";scrollcolor=#2F7DFF\n"
+"\n"
 "; ---- audio meter: a bar along the bottom of any running window's button that's playing sound ----\n"
 "meter=1\n"
 "; bar height in px (sits in the bottom padding, so keep vpad >= meterh)\n"
@@ -586,6 +619,16 @@ static void LoadConfig() {
         else if (k == L"flash")       { g_cfg.flashColor = ParseColor(v, g_cfg.flashColor); g_cfg.flashColorSet = true; }
         else if (k == L"flashrate")   g_cfg.flashRate = std::max(100, n);
         else if (k == L"flashcount")  g_cfg.flashCount = std::max(0, n);
+        else if (k == L"icons")       g_cfg.icons = n != 0;
+        else if (k == L"iconsize")    g_cfg.iconSize = std::max(0, n);
+        else if (k == L"iconpad")     g_cfg.iconPad = std::max(0, n);
+        else if (k == L"icondither")  g_cfg.iconDither = n != 0;
+        else if (k == L"iconshades") {
+            auto parts = Split(v, L',');
+            for (size_t j = 0; j < parts.size() && j < 3; ++j) g_cfg.iconShade[j] = ParseColor(parts[j], g_cfg.iconShade[j]);
+        }
+        else if (k == L"scrollw")     g_cfg.scrollW = std::max(0, n);
+        else if (k == L"scrollcolor") { g_cfg.scrollColor = ParseColor(v, g_cfg.scrollColor); g_cfg.scrollColorSet = true; }
         else if (k == L"hoverbright") g_cfg.hoverBright = std::max(-255, std::min(255, n));
         else if (k == L"strip")       { if (!v.empty()) g_cfg.strip.push_back(v); }
         else if (k == L"pindir")      g_cfg.pinDir = v;
@@ -602,6 +645,7 @@ static void LoadConfig() {
 
     if (!g_cfg.startColorSet) g_cfg.startColor = g_cfg.text;
     if (!g_cfg.flashColorSet) g_cfg.flashColor = g_cfg.meterColor;
+    if (!g_cfg.scrollColorSet) g_cfg.scrollColor = g_cfg.meterColor;
     if (!g_cfg.activeFaceSet) g_cfg.activeFace = g_cfg.face;
     if (!g_cfg.pinFaceSet)    g_cfg.pinFace = g_cfg.face;
     if (!g_cfg.clockFaceSet)  g_cfg.clockFace = g_cfg.face;
@@ -858,6 +902,215 @@ static std::vector<std::wstring> Wrap(HDC dc, const std::wstring& s, int maxW, i
     return out;
 }
 
+// ---------- icons ----------
+
+static BITMAPINFO Dib32(int w, int h) {
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;                          // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    return bi;
+}
+
+// px: s*s straight-alpha BGRA. Contrast-stretches the icon's own brightness range, then maps it
+// to 3 shades (optionally Bayer-dithered); pixels under 50% alpha become transparent.
+static IconPtr MakeIcon2(const std::vector<uint32_t>& px, int s) {
+    if (s <= 0 || (int)px.size() != s * s) return nullptr;
+    std::vector<int> lum(s * s, -1);
+    int lo = 255, hi = 0;
+    for (int i = 0; i < s * s; ++i) {
+        uint32_t p = px[i];
+        if ((int)(p >> 24) < 128) continue;
+        int b = p & 255, g = (p >> 8) & 255, r = (p >> 16) & 255;
+        int l = (r * 299 + g * 587 + b * 114) / 1000;
+        lum[i] = l;
+        lo = std::min(lo, l);
+        hi = std::max(hi, l);
+    }
+    if (hi < lo) return nullptr;                         // nothing opaque
+    uint32_t shade[3];
+    for (int k = 0; k < 3; ++k) {
+        COLORREF c = g_cfg.iconShade[k];
+        shade[k] = 0xFF000000u | ((uint32_t)GetRValue(c) << 16) | ((uint32_t)GetGValue(c) << 8) | GetBValue(c);
+    }
+    static const int bayer[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+    BITMAPINFO bi = Dib32(s, s);
+    void* bits = nullptr;
+    HBITMAP bmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp || !bits) return nullptr;
+    uint32_t* out = (uint32_t*)bits;
+    bool flat = hi - lo < 48;                            // one-colour glyph: show it in the light shade
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) {
+            int i = y * s + x;
+            if (lum[i] < 0) { out[i] = 0; continue; }
+            float t = flat ? 1.0f : (lum[i] - lo) / (float)(hi - lo);
+            float d = g_cfg.iconDither ? (bayer[y & 3][x & 3] + 0.5f) / 16.0f : 0.5f;
+            int q = std::max(0, std::min(2, (int)(t * 2.0f + d)));
+            out[i] = shade[q];                           // opaque, so premultiplied == straight
+        }
+    GdiFlush();
+    IconPtr ip = std::make_shared<Icon2>();
+    ip->bmp = bmp;
+    ip->size = s;
+    return ip;
+}
+
+// Renders an HICON onto black and onto white; the difference recovers alpha for any icon format.
+static std::vector<uint32_t> RasterHIcon(HICON hi, int s) {
+    std::vector<uint32_t> out;
+    if (!hi || s <= 0) return out;
+    BITMAPINFO bi = Dib32(s, s);
+    void *pb = nullptr, *pw = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bb = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &pb, nullptr, 0);
+    HBITMAP bw = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &pw, nullptr, 0);
+    if (bb && bw && pb && pw) {
+        memset(pb, 0x00, (size_t)s * s * 4);
+        memset(pw, 0xFF, (size_t)s * s * 4);
+        HGDIOBJ old = SelectObject(dc, bb);
+        DrawIconEx(dc, 0, 0, hi, s, s, 0, nullptr, DI_NORMAL);
+        SelectObject(dc, bw);
+        DrawIconEx(dc, 0, 0, hi, s, s, 0, nullptr, DI_NORMAL);
+        SelectObject(dc, old);
+        GdiFlush();
+        const uint32_t* B = (const uint32_t*)pb;
+        const uint32_t* Wt = (const uint32_t*)pw;
+        out.resize((size_t)s * s);
+        for (int i = 0; i < s * s; ++i) {
+            int a = 0;
+            for (int ch = 0; ch < 3; ++ch)
+                a += 255 - ((int)((Wt[i] >> (8 * ch)) & 255) - (int)((B[i] >> (8 * ch)) & 255));
+            a = std::max(0, std::min(255, a / 3));
+            uint32_t px = (uint32_t)a << 24;
+            for (int ch = 0; ch < 3; ++ch) {
+                int vb = (B[i] >> (8 * ch)) & 255;
+                int c = a ? std::min(255, vb * 255 / a) : 0;
+                px |= (uint32_t)c << (8 * ch);
+            }
+            out[i] = px;
+        }
+    }
+    if (bb) DeleteObject(bb);
+    if (bw) DeleteObject(bw);
+    DeleteDC(dc);
+    return out;
+}
+
+// Store apps: ask the shell for the app's icon image.
+static std::vector<uint32_t> RasterShellItem(const std::wstring& parse, int s) {
+    std::vector<uint32_t> out;
+    IShellItemImageFactory* f = nullptr;
+    if (FAILED(SHCreateItemFromParsingName(parse.c_str(), nullptr, IID_IShellItemImageFactory, (void**)&f)) || !f)
+        return out;
+    HBITMAP hb = nullptr;
+    SIZE want{s, s};
+    if (SUCCEEDED(f->GetImage(want, SIIGBF_ICONONLY, &hb)) && hb) {
+        BITMAP bm{};
+        GetObjectW(hb, sizeof(bm), &bm);
+        int w = bm.bmWidth, h = bm.bmHeight;
+        if (w > 0 && h > 0) {
+            std::vector<uint32_t> src((size_t)w * h);
+            BITMAPINFO bi = Dib32(w, h);
+            HDC sdc = GetDC(nullptr);
+            int got = GetDIBits(sdc, hb, 0, h, src.data(), &bi, DIB_RGB_COLORS);
+            ReleaseDC(nullptr, sdc);
+            if (got > 0) {
+                bool anyAlpha = false, straight = false;
+                for (uint32_t p : src) {
+                    int a = p >> 24;
+                    if (a) anyAlpha = true;
+                    if ((int)(p & 255) > a || (int)((p >> 8) & 255) > a || (int)((p >> 16) & 255) > a) straight = true;
+                }
+                out.resize((size_t)s * s);
+                for (int y = 0; y < s; ++y)
+                    for (int x = 0; x < s; ++x) {
+                        uint32_t p = src[(size_t)(y * h / s) * w + (x * w / s)];
+                        int a = anyAlpha ? (int)(p >> 24) : 255;
+                        uint32_t px = (uint32_t)a << 24;
+                        for (int ch = 0; ch < 3; ++ch) {
+                            int c = (p >> (8 * ch)) & 255;
+                            if (anyAlpha && !straight && a > 0) c = std::min(255, c * 255 / a);
+                            px |= (uint32_t)c << (8 * ch);
+                        }
+                        out[(size_t)y * s + x] = px;
+                    }
+            }
+        }
+        DeleteObject(hb);
+    }
+    f->Release();
+    return out;
+}
+
+static IconPtr IconFromFile(const std::wstring& path, int s) {
+    if (path.empty()) return nullptr;
+    SHFILEINFOW sfi{};
+    UINT flags = SHGFI_ICON | (s > 16 ? SHGFI_LARGEICON : SHGFI_SMALLICON);
+    if (!SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof(sfi), flags) || !sfi.hIcon) return nullptr;
+    IconPtr ip = MakeIcon2(RasterHIcon(sfi.hIcon, s), s);
+    DestroyIcon(sfi.hIcon);
+    return ip;
+}
+
+// Bare names like "explorer.exe" are looked up on PATH.
+static std::wstring PinFilePath(const Pin& p) {
+    std::wstring e = ExpandEnv(p.path);
+    if (e.find(L'\\') != std::wstring::npos || e.find(L'/') != std::wstring::npos) return e;
+    if (e.find(L':') != std::wstring::npos) return L"";           // a URI like ms-settings:
+    wchar_t buf[MAX_PATH];
+    if (SearchPathW(nullptr, e.c_str(), nullptr, MAX_PATH, buf, nullptr)) return buf;
+    return Resolve(e);
+}
+
+static IconPtr PinIcon(const Pin& p, int s) {
+    std::wstring key = p.aumid.empty() ? L"path:" + p.path : L"app:" + p.aumid;
+    auto it = g_pinIcons.find(key);
+    if (it != g_pinIcons.end()) return it->second;       // also caches "no icon"
+    IconPtr ip = p.aumid.empty() ? IconFromFile(PinFilePath(p), s)
+                                 : MakeIcon2(RasterShellItem(L"shell:AppsFolder\\" + p.aumid, s), s);
+    g_pinIcons[key] = ip;
+    return ip;
+}
+
+static HICON WindowIconHandle(HWND h, bool big) {
+    const WPARAM order[3] = {big ? (WPARAM)ICON_BIG : (WPARAM)ICON_SMALL2, big ? (WPARAM)ICON_SMALL2 : (WPARAM)ICON_BIG,
+                             (WPARAM)ICON_SMALL};
+    for (WPARAM w : order) {
+        DWORD_PTR res = 0;
+        if (SendMessageTimeoutW(h, WM_GETICON, w, 0, SMTO_ABORTIFHUNG | SMTO_BLOCK, 40, &res) && res) return (HICON)res;
+    }
+    ULONG_PTR c = GetClassLongPtrW(h, big ? GCLP_HICON : GCLP_HICONSM);
+    if (!c) c = GetClassLongPtrW(h, big ? GCLP_HICONSM : GCLP_HICON);
+    return (HICON)c;
+}
+
+// The window's own icon; falls back to its exe's icon and retries for a few seconds,
+// since many apps set their window icon only after the window appears.
+static void EnsureTaskIcon(Task& t, int s) {
+    if (t.iconFinal) return;
+    DWORD now = GetTickCount();
+    if (t.iconTries > 0 && (LONG)(now - t.iconNext) < 0) return;
+    HICON hi = WindowIconHandle(t.hwnd, s > 16);
+    IconPtr ip = hi ? MakeIcon2(RasterHIcon(hi, s), s) : nullptr;    // window icons are not ours to destroy
+    if (ip) {
+        t.icon = ip;
+        t.iconFinal = true;
+        return;
+    }
+    if (!t.icon) t.icon = IconFromFile(t.exe, s);
+    if (++t.iconTries >= 6) t.iconFinal = true;
+    t.iconNext = now + 1000;
+}
+
+static void ResetIcons() {
+    g_pinIcons.clear();
+    for (auto& t : g_tasks) { t.icon.reset(); t.iconTries = 0; t.iconFinal = false; t.iconNext = 0; }
+}
+
 // ---------- drawing ----------
 
 static int ButtonHeight(int lines) {
@@ -865,7 +1118,8 @@ static int ButtonHeight(int lines) {
 }
 
 static void DrawButton(HDC dc, RECT r, bool pressed, COLORREF border, COLORREF face, COLORREF txt,
-                       const std::vector<std::wstring>& lines) {
+                       const std::vector<std::wstring>& lines, const Icon2* icon = nullptr,
+                       int indent = 0, BYTE iconAlpha = 255) {
     Fill(dc, r, border);                                // 1px outline
     RECT in{r.left + 1, r.top + 1, r.right - 1, r.bottom - 1};
     if (in.right <= in.left || in.bottom <= in.top) return;
@@ -887,6 +1141,16 @@ static void DrawButton(HDC dc, RECT r, bool pressed, COLORREF border, COLORREF f
     SetTextColor(dc, txt);
     int x = in.left + g_cfg.pad + shift;
     int y = in.top + g_cfg.vpad + shift;
+    if (icon && icon->bmp) {
+        if (!g_iconDC) g_iconDC = CreateCompatibleDC(nullptr);
+        HGDIOBJ old = SelectObject(g_iconDC, icon->bmp);
+        int is = icon->size;
+        int iy = is <= g_lineH ? y + (g_lineH - is) / 2 : y;     // centred on the first text line
+        BLENDFUNCTION bf{AC_SRC_OVER, 0, iconAlpha, AC_SRC_ALPHA};
+        AlphaBlend(dc, x, iy, is, is, g_iconDC, 0, 0, is, is, bf);
+        SelectObject(g_iconDC, old);
+    }
+    x += indent;
     for (auto& l : lines) {
         ExtTextOutW(dc, x, y, ETO_CLIPPED, &clip, l.c_str(), (UINT)l.size(), nullptr);
         y += g_lineH + g_cfg.lineGap;
@@ -918,13 +1182,15 @@ static COLORREF Brighten(COLORREF c, int d) {
 
 static COLORREF HoverFace(COLORREF face, bool hov) { return hov ? Brighten(face, g_cfg.hoverBright) : face; }
 
-static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, int bottom, int scroll, HWND fg) {
+// Buttons span x0..x1; sbX >= 0 draws a scroll thumb at that x when content overflows.
+static void DrawRegion(HDC dc, int W, int x0, int x1, const std::vector<Item>& items, int top, int bottom,
+                       int scroll, HWND fg, int content, int sbX) {
     if (bottom <= top) return;
     HRGN clip = CreateRectRgn(0, top, W, bottom);
     SelectClipRgn(dc, clip);
     int y = top - scroll;
     for (auto& it : items) {
-        RECT r{0, y, W, y + it.h};
+        RECT r{x0, y, x1, y + it.h};
         if (r.bottom > top && r.top < bottom) {
             bool hov = g_hoverKind == it.kind && g_hoverIdx == it.idx;
             if (it.kind == K_TASK) {
@@ -934,14 +1200,17 @@ static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, i
                 COLORREF face = HoverFace(blink ? g_cfg.flashColor : (active ? g_cfg.activeFace : g_cfg.face), hov);
                 COLORREF txt = (active || blink) ? g_cfg.activeText : hov ? g_cfg.hoverText : (t.iconic ? g_cfg.dim : g_cfg.text);
                 bool lit = (g_cfg.borderMode == 1 && active) || (g_cfg.borderMode == 2 && (active || t.visible));
-                DrawButton(dc, r, active, lit ? g_cfg.activeBorder : g_cfg.outline, face, txt, it.lines);
+                DrawButton(dc, r, active, lit ? g_cfg.activeBorder : g_cfg.outline, face, txt, it.lines,
+                           g_cfg.icons ? t.icon.get() : nullptr, g_indent, t.iconic ? 120 : 255);
                 if (g_cfg.meter && t.level > 0.001f) {
                     int x0 = r.left + 1, x1 = r.right - 1;
                     int w = (int)((x1 - x0) * std::min(1.0f, t.level) + 0.5f);
                     if (w > 0) Fill(dc, RECT{x0, r.bottom - 1 - g_cfg.meterH, x0 + w, r.bottom - 1}, g_cfg.meterColor);
                 }
             } else {
-                DrawButton(dc, r, false, g_cfg.outline, HoverFace(g_cfg.pinFace, hov), hov ? g_cfg.hoverText : g_cfg.text, it.lines);
+                IconPtr ic = g_cfg.icons && it.idx < PinCount() ? PinIcon(PinAt(it.idx), g_iconS) : nullptr;
+                DrawButton(dc, r, false, g_cfg.outline, HoverFace(g_cfg.pinFace, hov), hov ? g_cfg.hoverText : g_cfg.text,
+                           it.lines, ic.get(), g_indent);
             }
         }
         g_rows.push_back(Row{r, it.kind, it.idx, top, bottom});
@@ -949,6 +1218,13 @@ static void DrawRegion(HDC dc, int W, const std::vector<Item>& items, int top, i
     }
     SelectClipRgn(dc, nullptr);
     DeleteObject(clip);
+
+    int area = bottom - top;
+    if (sbX >= 0 && g_cfg.scrollW > 0 && content > area) {
+        int th = std::max(std::min(area, 8), (int)((long long)area * area / content));
+        int ty = top + (int)((long long)(area - th) * scroll / std::max(1, content - area));
+        Fill(dc, RECT{sbX, ty, sbX + g_cfg.scrollW, ty + th}, g_cfg.scrollColor);
+    }
 }
 
 // ░▒▓█ drawn as real pixel dither patterns, stretched across the button, so it's crisp in any font.
@@ -989,15 +1265,26 @@ static void Paint(HWND hwnd) {
     g_lineH = tm.tmHeight;
     int textW = std::max(1, W - 2 - 2 * g_cfg.pad - 1);   // -1 leaves room for the pressed shift
 
-    std::vector<Item> tasks, pins;
-    for (int i = 0; i < (int)g_tasks.size(); ++i) {
-        auto lines = Wrap(mdc, g_tasks[i].title, textW, g_cfg.maxLines);
-        tasks.push_back(Item{K_TASK, i, lines, ButtonHeight((int)lines.size())});
-    }
-    for (int i = 0; i < PinCount(); ++i) {
-        auto lines = Wrap(mdc, PinAt(i).name, textW, g_cfg.maxLines);
-        pins.push_back(Item{K_PIN, i, lines, ButtonHeight((int)lines.size())});
-    }
+    // Icons: size follows the text line unless set; text is indented past the icon on every line.
+    int iconS = g_cfg.iconSize ? g_cfg.iconSize : g_lineH;
+    if (g_cfg.icons && iconS != g_iconS) ResetIcons();
+    g_iconS = iconS;
+    g_indent = g_cfg.icons ? iconS + g_cfg.iconPad : 0;
+    int minH = g_cfg.icons ? 2 + 2 * g_cfg.vpad + iconS : 0;
+    if (g_cfg.icons) for (auto& t : g_tasks) EnsureTaskIcon(t, iconS);
+
+    auto build = [&](int kind, int bw) {
+        std::vector<Item> v;
+        int tw = std::max(1, bw - 2 - 2 * g_cfg.pad - 1 - g_indent);
+        int n = kind == K_TASK ? (int)g_tasks.size() : PinCount();
+        for (int i = 0; i < n; ++i) {
+            auto lines = Wrap(mdc, kind == K_TASK ? g_tasks[i].title : PinAt(i).name, tw, g_cfg.maxLines);
+            v.push_back(Item{kind, i, lines, std::max(ButtonHeight((int)lines.size()), minH)});
+        }
+        return v;
+    };
+    int sbW = g_cfg.scrollW, sbGap = sbW ? 1 : 0;
+    int narrowW = std::max(4, W - sbW - sbGap);
 
     // Clock: own font size, wraps if it doesn't fit the bar width.
     std::vector<std::wstring> clockLines;
@@ -1021,20 +1308,36 @@ static void Paint(HWND hwnd) {
     int bottomLimit = g_cfg.clock ? clockTop - g_cfg.gap
                     : g_cfg.startButton ? startTop - g_cfg.gap : H;
 
+    // A section that overflows is rewrapped a little narrower to make room for its scroll indicator.
+    int pinsMaxArea = std::max(0, bottomLimit) * g_cfg.pinsMax / 100;
+    std::vector<Item> pins = build(K_PIN, W);
+    bool pinsScroll = sbW > 0 && ContentHeight(pins) > pinsMaxArea;
+    if (pinsScroll) pins = build(K_PIN, narrowW);
     int pinsContent = ContentHeight(pins);
-    int pinsArea = pins.empty() ? 0 : std::min(pinsContent, std::max(0, bottomLimit) * g_cfg.pinsMax / 100);
+    int pinsArea = pins.empty() ? 0 : std::min(pinsContent, pinsMaxArea);
     g_pinsBottom = bottomLimit;
     g_pinsTop = bottomLimit - pinsArea;
     g_tasksTop = 0;
     g_tasksBottom = pins.empty() ? bottomLimit : g_pinsTop - g_cfg.gap;
 
-    g_scrollTasks = std::max(0, std::min(g_scrollTasks, ContentHeight(tasks) - (g_tasksBottom - g_tasksTop)));
+    std::vector<Item> tasks = build(K_TASK, W);
+    bool tasksScroll = sbW > 0 && ContentHeight(tasks) > g_tasksBottom - g_tasksTop;
+    if (tasksScroll) tasks = build(K_TASK, narrowW);
+    int tasksContent = ContentHeight(tasks);
+
+    g_scrollTasks = std::max(0, std::min(g_scrollTasks, tasksContent - (g_tasksBottom - g_tasksTop)));
     g_scrollPins  = std::max(0, std::min(g_scrollPins, pinsContent - pinsArea));
+
+    // Indicator sits on the inner edge (away from the screen edge the bar is docked to).
+    int nx0 = g_cfg.rightSide ? sbW + sbGap : 0, nx1 = g_cfg.rightSide ? W : W - sbW - sbGap;
+    int sbX = g_cfg.rightSide ? 0 : W - sbW;
 
     g_rows.clear();
     HWND fg = GetForegroundWindow();
-    DrawRegion(mdc, W, tasks, g_tasksTop, g_tasksBottom, g_scrollTasks, fg);
-    DrawRegion(mdc, W, pins, g_pinsTop, g_pinsBottom, g_scrollPins, fg);
+    DrawRegion(mdc, W, tasksScroll ? nx0 : 0, tasksScroll ? nx1 : W, tasks, g_tasksTop, g_tasksBottom,
+               g_scrollTasks, fg, tasksContent, tasksScroll ? sbX : -1);
+    DrawRegion(mdc, W, pinsScroll ? nx0 : 0, pinsScroll ? nx1 : W, pins, g_pinsTop, g_pinsBottom,
+               g_scrollPins, fg, pinsContent, pinsScroll ? sbX : -1);
 
     if (g_cfg.clock) {
         RECT r{0, clockTop, W, clockTop + clockH};
@@ -1256,6 +1559,7 @@ static void LaunchPin(const Pin& p) {
 
 static void Reload() {
     LoadConfig();
+    ResetIcons();
     CreateBarFont();
     ShowSystemTaskbars(!g_cfg.hideTaskbar);
     AppBarSetPos();
@@ -1603,6 +1907,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_loadedFontFile.empty()) RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
         if (g_font) DeleteObject(g_font);
         if (g_clockFont) DeleteObject(g_clockFont);
+        g_pinIcons.clear();
+        g_tasks.clear();
+        if (g_iconDC) DeleteDC(g_iconDC);
         PostQuitMessage(0);
         return 0;
     }

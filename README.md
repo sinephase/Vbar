@@ -1,9 +1,11 @@
 # Vbar
 
-Vertical minimalist task bar for Windows 11 (also runs on Windows 10): a text-only taskbar. No icons — every running window and pinned app is a compact, old-school bevel button, packed down one edge of the screen.
+Vertical minimalist task bar for Windows 11 (also runs on Windows 10). Every running window and pinned app is a compact, old-school bevel button with its name and a tiny 2-bit monochrome version of its icon, packed down one edge of the screen.
 
 - **Running windows** at the top, **pinned apps** (your own + your Windows Start menu pins) below, then a **clock** and a `░▒▓█` **start button** at the very bottom
 - **Word-wrapped** titles, so long names stay readable instead of truncating
+- **2-bit icons** — each app's real icon, contrast-stretched and reduced to transparent + 3 grey shades (optionally dithered)
+- **Scroll indicator** — a thin blue thumb on the inner edge of any section that overflows
 - **Focused window** drawn pressed with a white border; minimized windows dimmed; buttons brighten on hover
 - **Attention flashing** — a window asking for attention (like a new message) blinks blue, then stays lit until you focus it
 - **Hover to focus** — resting on a button brings that window to the front instantly
@@ -48,6 +50,10 @@ Edit `vbar.ini` (right-click the clock → **Edit config**), then right-click �
 
 **Clock & start button:** `clock`, `clockfontsize` (0 = same as `fontsize`), `clocklines` (wraps if too wide), `clockbold`, `startbutton`, `startheight` (0 = one text line), `startcolor`
 
+**Icons:** `icons`, `iconsize` (0 = text line height), `iconpad`, `icondither`, `iconshades` (three colours, darkest to lightest)
+
+**Scroll indicator:** `scrollw` (px, 0 = off), `scrollcolor` (defaults to `metercolor`)
+
 **Audio meter:** `meter`, `meterh`, `metercolor`, `meterdb` (dB range across full width, 0 = linear), `meterfall`, `meterfps`
 
 **Pins:** `startpins` (import Windows Start pins), `pinsmax` (max % of bar height), `pin=Name|path|args|workingdir` (env vars allowed), `pindir` (a folder of shortcuts), `strip=` (title suffixes to trim, e.g. `- Google Chrome`)
@@ -63,7 +69,7 @@ cl /O2 /EHsc /DUNICODE /D_UNICODE vbar.cpp /link /SUBSYSTEM:WINDOWS
 
 MinGW-w64:
 ```
-g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid
+g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32
 ```
 
 ## License
