@@ -46,6 +46,8 @@
 #pragma comment(lib, "msimg32.lib")
 #endif
 
+#define VBAR_VERSION L"1.2"
+
 #define WM_APPBAR    (WM_APP + 1)
 #define WM_STARTPINS (WM_APP + 2)
 #define TIMER_CLOCK 1
@@ -1623,6 +1625,7 @@ static void ShowMenu(POINT screenPt) {
     AppendMenuW(m, MF_STRING, IDM_EDIT, L"Edit config");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"Exit vbar");
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"vbar " VBAR_VERSION);
     SetForegroundWindow(g_hwnd);
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, g_hwnd, nullptr);
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
