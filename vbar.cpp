@@ -867,7 +867,9 @@ static bool RefreshTasks() {
 static bool IsBreakAfter(wchar_t c) { return c == L'-' || c == L'/' || c == L'\\' || c == L'_' || c == L'|'; }
 
 // Wraps at spaces (or after - / \ _ |), hard-breaks words longer than a line, caps at maxLines.
-static std::vector<std::wstring> Wrap(HDC dc, const std::wstring& s, int maxW, int maxLines) {
+// The first narrowLines lines get narrowW (they sit beside the icon); the rest get the full maxW.
+static std::vector<std::wstring> Wrap(HDC dc, const std::wstring& s, int maxW, int maxLines,
+                                      int narrowW = 0, int narrowLines = 0) {
     std::vector<std::wstring> out;
     size_t pos = 0, n = s.size();
     while (pos < n && (int)out.size() < maxLines) {
@@ -875,7 +877,8 @@ static std::vector<std::wstring> Wrap(HDC dc, const std::wstring& s, int maxW, i
         if (pos >= n) break;
         int fit = 0;
         SIZE sz;
-        GetTextExtentExPointW(dc, s.c_str() + pos, (int)(n - pos), maxW, &fit, nullptr, &sz);
+        int lineW = (int)out.size() < narrowLines ? narrowW : maxW;
+        GetTextExtentExPointW(dc, s.c_str() + pos, (int)(n - pos), lineW, &fit, nullptr, &sz);
         if (fit < 1) fit = 1;
         if ((size_t)fit >= n - pos) { out.push_back(Trim(s.substr(pos))); break; }
 
@@ -1115,6 +1118,16 @@ static void ResetIcons() {
 
 // ---------- drawing ----------
 
+// Text lines that overlap the icon vertically are indented past it; lines below wrap under it.
+static int IndentLines() {
+    if (!g_cfg.icons || g_iconS <= 0) return 0;
+    int iconTop = g_iconS <= g_lineH ? (g_lineH - g_iconS) / 2 : 0;
+    int iconBottom = iconTop + g_iconS + g_cfg.lineGap;      // keep at least linegap below the icon
+    int k = 0;
+    while (k * (g_lineH + g_cfg.lineGap) < iconBottom) ++k;
+    return k;
+}
+
 static int ButtonHeight(int lines) {
     return 2 + 2 * g_cfg.vpad + lines * g_lineH + (lines - 1) * g_cfg.lineGap;
 }
@@ -1152,9 +1165,11 @@ static void DrawButton(HDC dc, RECT r, bool pressed, COLORREF border, COLORREF f
         AlphaBlend(dc, x, iy, is, is, g_iconDC, 0, 0, is, is, bf);
         SelectObject(g_iconDC, old);
     }
-    x += indent;
-    for (auto& l : lines) {
-        ExtTextOutW(dc, x, y, ETO_CLIPPED, &clip, l.c_str(), (UINT)l.size(), nullptr);
+    int beside = indent ? IndentLines() : 0;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        const std::wstring& l = lines[i];
+        int lx = x + ((int)i < beside ? indent : 0);
+        ExtTextOutW(dc, lx, y, ETO_CLIPPED, &clip, l.c_str(), (UINT)l.size(), nullptr);
         y += g_lineH + g_cfg.lineGap;
     }
 }
@@ -1277,10 +1292,13 @@ static void Paint(HWND hwnd) {
 
     auto build = [&](int kind, int bw) {
         std::vector<Item> v;
-        int tw = std::max(1, bw - 2 - 2 * g_cfg.pad - 1 - g_indent);
+        int fullW = std::max(1, bw - 2 - 2 * g_cfg.pad - 1);
+        int tw = std::max(1, fullW - g_indent);
+        int beside = g_indent ? IndentLines() : 0;
         int n = kind == K_TASK ? (int)g_tasks.size() : PinCount();
         for (int i = 0; i < n; ++i) {
-            auto lines = Wrap(mdc, kind == K_TASK ? g_tasks[i].title : PinAt(i).name, tw, g_cfg.maxLines);
+            auto lines = Wrap(mdc, kind == K_TASK ? g_tasks[i].title : PinAt(i).name, fullW, g_cfg.maxLines,
+                              tw, beside);
             v.push_back(Item{kind, i, lines, std::max(ButtonHeight((int)lines.size()), minH)});
         }
         return v;

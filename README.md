@@ -3,7 +3,7 @@
 Vertical minimalist task bar for Windows 11 (also runs on Windows 10). Every running window and pinned app is a compact, old-school bevel button with its name and a tiny 2-bit monochrome version of its icon, packed down one edge of the screen.
 
 - **Running windows** at the top, **pinned apps** (your own + your Windows Start menu pins) below, then a **clock** and a `░▒▓█` **start button** at the very bottom
-- **Word-wrapped** titles, so long names stay readable instead of truncating
+- **Word-wrapped** titles, so long names stay readable instead of truncating; text sits beside the icon and wraps underneath it once it clears, however big the icon is
 - **2-bit icons** — each app's real icon, contrast-stretched and reduced to transparent + 3 grey shades (optionally dithered)
 - **Scroll indicator** — a thin blue thumb on the inner edge of any section that overflows
 - **Focused window** drawn pressed with a white border; minimized windows dimmed; buttons brighten on hover
