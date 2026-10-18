@@ -3,6 +3,7 @@
 Vertical minimalist task bar for Windows 11 (also runs on Windows 10). Every running window and pinned app is a compact, old-school bevel button with its name and a tiny 2-bit monochrome version of its icon, packed down one edge of the screen.
 
 - **Running windows** at the top, **pinned apps** (your own + your Windows Start menu pins) below, then a **clock** and a `░▒▓█` **start button** at the very bottom
+- **Calendar pop-out** — click the clock for live time, the full date and a month grid; it stays while you hover it and closes a few seconds after you leave
 - **Word-wrapped** titles, so long names stay readable instead of truncating; text sits beside the icon and wraps underneath it once it clears, however big the icon is
 - **2-bit icons** — each app's real icon, contrast-stretched and reduced to transparent + 3 grey shades (optionally dithered)
 - **Scroll indicator** — a thin blue thumb on the inner edge of any section that overflows
@@ -27,7 +28,7 @@ To replace the Windows taskbar entirely: turn on taskbar auto-hide in Windows se
 | Mouse | Running window | Pinned app | Clock / empty space |
 |---|---|---|---|
 | Hover | Bring to front | — | — |
-| Left-click | Focus, or minimize if already focused | Launch | — (start button: Start menu) |
+| Left-click | Focus, or minimize if already focused | Launch | Clock: calendar · start button: Start menu |
 | Middle-click | Close | — | — |
 | Right-click | Window menu | Pin menu | Position, reload, edit config, exit (start button: Win+X menu) |
 | Wheel | Scroll the window list | Scroll the pinned list | — |
@@ -48,7 +49,7 @@ Edit `vbar.ini` (right-click the clock → **Edit config**), then right-click �
 
 **Behaviour:** `bordermode` (`focused` / `visible` / `off`), `hoverfocus`, `hoverdelay` (ms, 0 = instant), `hoverrestore`, `hidetaskbar`
 
-**Clock & start button:** `clock`, `clockfontsize` (0 = same as `fontsize`), `clocklines` (wraps if too wide), `clockbold`, `startbutton`, `startheight` (0 = one text line), `startcolor`
+**Clock & start button:** `clock`, `clock24` (0 = 12-hour, the default; 1 = 24-hour; also in the right-click menu), `clockfontsize` (0 = same as `fontsize`), `clocklines` (wraps if too wide), `clockbold`, `caltimeout` (seconds the calendar lingers after the mouse leaves), `weekstart` (0 = Sunday, 1 = Monday), `startbutton`, `startheight` (0 = one text line), `startcolor`
 
 **Icons:** `icons`, `iconsize` (0 = text line height), `iconpad`, `icondither`, `iconshades` (three colours, darkest to lightest)
 

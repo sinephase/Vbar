@@ -46,7 +46,7 @@
 #pragma comment(lib, "msimg32.lib")
 #endif
 
-#define VBAR_VERSION L"1.2"
+#define VBAR_VERSION L"1.3"
 
 #define WM_APPBAR    (WM_APP + 1)
 #define WM_STARTPINS (WM_APP + 2)
@@ -55,11 +55,13 @@
 #define TIMER_HOVER 3
 #define TIMER_METER 4
 #define TIMER_BLINK 5
+#define TIMER_CAL 6
 #define IDM_RELOAD 100
 #define IDM_EDIT 101
 #define IDM_EXIT 102
 #define IDM_SIDE_LEFT 110
 #define IDM_SIDE_RIGHT 111
+#define IDM_CLOCK24 112
 #define IDM_MON_PRIMARY 119
 #define IDM_MON_BASE 120
 #define IDM_T_SWITCH   200
@@ -95,7 +97,9 @@ struct Config {
     bool bold = false, hoverRestore = false, hoverFocus = true, meter = true, rightSide = false;
     int monitor = 0;   // 0 = primary, otherwise Windows display number
     int clockFontSize = 0, clockLines = 2, clockBold = -1, startHeight = 0;   // 0 / -1 = follow the main font
-    bool startButton = true;
+    bool startButton = true, clock24 = false;
+    int weekStart = 0;   // 0 = Sunday, 1 = Monday
+    int calTimeout = 5;  // seconds the calendar stays up once the mouse leaves it
     COLORREF startColor = RGB(216, 216, 216);
     bool startColorSet = false;
     int meterH = 2, meterFall = 4, meterDb = 48, meterFps = 30;
@@ -119,7 +123,11 @@ struct Config {
 
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
-static HFONT g_font = nullptr, g_clockFont = nullptr;
+static HFONT g_font = nullptr, g_clockFont = nullptr, g_calBigFont = nullptr;
+static HWND g_calHwnd = nullptr;
+static int g_calYear = 0, g_calMonth = 0, g_calHover = 0;
+static DWORD g_calClosedAt = 0, g_calLastHover = 0;
+static WORD g_calLastSecond = 0xFFFF;
 static bool g_blinkOn = true;
 static int g_blinkTicks = 0;
 static std::wstring g_exeDir, g_iniPath, g_loadedFontFile;
@@ -442,6 +450,12 @@ static const char* kDefaultIni =
 "; clock text size in px (0 = same as fontsize); it wraps onto up to clocklines lines if it doesn't fit\n"
 "clockfontsize=0\n"
 "clocklines=2\n"
+"; 0 = 12-hour (5:11 PM), 1 = 24-hour (17:11). Also in the right-click menu.\n"
+"clock24=0\n"
+"; click the clock for a calendar; first day of the week: 0 = Sunday, 1 = Monday\n"
+"weekstart=0\n"
+"; the calendar stays open while the mouse is over it (or the clock) and closes this many seconds after it leaves\n"
+"caltimeout=5\n"
 "; clockbold=1   (leave out to follow bold)\n"
 "\n"
 "; start button at the very bottom: click = Start menu, right-click = Win+X menu\n"
@@ -601,6 +615,9 @@ static void LoadConfig() {
         else if (k == L"clockfontsize") g_cfg.clockFontSize = std::max(0, n);
         else if (k == L"clocklines")  g_cfg.clockLines = std::max(1, n);
         else if (k == L"clockbold")   g_cfg.clockBold = n != 0;
+        else if (k == L"clock24")     g_cfg.clock24 = n != 0;
+        else if (k == L"caltimeout")  g_cfg.calTimeout = std::max(1, n);
+        else if (k == L"weekstart")   g_cfg.weekStart = (n == 1) ? 1 : 0;
         else if (k == L"startbutton") g_cfg.startButton = n != 0;
         else if (k == L"startheight") g_cfg.startHeight = std::max(0, n);
         else if (k == L"startcolor")  { g_cfg.startColor = ParseColor(v, g_cfg.startColor); g_cfg.startColorSet = true; }
@@ -661,6 +678,7 @@ static void LoadConfig() {
 static void CreateBarFont() {
     if (g_font) { DeleteObject(g_font); g_font = nullptr; }
     if (g_clockFont) { DeleteObject(g_clockFont); g_clockFont = nullptr; }
+    if (g_calBigFont) { DeleteObject(g_calBigFont); g_calBigFont = nullptr; }
     if (!g_loadedFontFile.empty()) {
         RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
         g_loadedFontFile.clear();
@@ -680,6 +698,10 @@ static void CreateBarFont() {
                               g_cfg.italic, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                               g_cfg.aa ? CLEARTYPE_QUALITY : NONANTIALIASED_QUALITY,
                               FIXED_PITCH | FF_MODERN, g_cfg.font.c_str());
+    g_calBigFont = CreateFontW(-g_cfg.fontSize * 2, 0, 0, 0, cweight, g_cfg.italic, FALSE, FALSE, DEFAULT_CHARSET,
+                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                               g_cfg.aa ? CLEARTYPE_QUALITY : NONANTIALIASED_QUALITY,
+                               FIXED_PITCH | FF_MODERN, g_cfg.font.c_str());
 }
 
 // ---------- taskbar / appbar ----------
@@ -1181,7 +1203,11 @@ static std::wstring ClockText() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t buf[64];
-    wsprintfW(buf, L"%02d:%02d %s %d %s", st.wHour, st.wMinute, D[st.wDayOfWeek], st.wDay, M[st.wMonth - 1]);
+    if (g_cfg.clock24)
+        wsprintfW(buf, L"%02d:%02d %s %d %s", st.wHour, st.wMinute, D[st.wDayOfWeek], st.wDay, M[st.wMonth - 1]);
+    else
+        wsprintfW(buf, L"%d:%02d %s %s %d %s", (st.wHour + 11) % 12 + 1, st.wMinute, st.wHour < 12 ? L"AM" : L"PM",
+                  D[st.wDayOfWeek], st.wDay, M[st.wMonth - 1]);
     return buf;
 }
 
@@ -1637,6 +1663,7 @@ static void ShowMenu(POINT screenPt) {
     AppendMenuW(screens, MF_STRING | (!g_cfg.rightSide ? MF_CHECKED : 0), IDM_SIDE_LEFT, L"Left edge");
     AppendMenuW(screens, MF_STRING | (g_cfg.rightSide ? MF_CHECKED : 0), IDM_SIDE_RIGHT, L"Right edge");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)screens, L"Position");
+    AppendMenuW(m, MF_STRING | (g_cfg.clock24 ? MF_CHECKED : 0), IDM_CLOCK24, L"24-hour clock");
 
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_RELOAD, L"Reload config + Start pins");
@@ -1648,7 +1675,10 @@ static void ShowMenu(POINT screenPt) {
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, g_hwnd, nullptr);
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
-    if (cmd == IDM_SIDE_LEFT || cmd == IDM_SIDE_RIGHT) {
+    if (cmd == IDM_CLOCK24) {
+        SetIniValue(L"clock24", g_cfg.clock24 ? L"0" : L"1");
+        Reload();
+    } else if (cmd == IDM_SIDE_LEFT || cmd == IDM_SIDE_RIGHT) {
         SetIniValue(L"side", cmd == IDM_SIDE_RIGHT ? L"right" : L"left");
         Reload();
     } else if (cmd == IDM_MON_PRIMARY) {
@@ -1750,6 +1780,278 @@ static void ShowPinMenu(int idx, POINT screenPt) {
     case IDM_P_LOCATION: OpenLocation(Resolve(p.path)); break;
     case IDM_EDIT: ShellExecuteW(nullptr, L"open", g_iniPath.c_str(), nullptr, nullptr, SW_SHOWNORMAL); break;
     }
+}
+
+// ---------- calendar pop-out ----------
+// Clicking the clock opens this beside the bar: live time, full date, and a month grid
+// in the same bevel style. It never takes focus. It stays open while the mouse is over it
+// or the clock, and closes caltimeout seconds after the mouse leaves (re-hovering resets that).
+// Wheel changes month, clicking the month name returns to today, clicking the clock closes it.
+
+enum { CAL_PREV = 1, CAL_NEXT = 2, CAL_TITLE = 3, CAL_DAY = 100 };
+struct CalHit { RECT r; int id; };
+static std::vector<CalHit> g_calHits;
+
+static int DaysIn(int y, int m) {
+    static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    return m == 2 && leap ? 29 : d[m - 1];
+}
+
+static int Weekday(int y, int m, int d) {             // 0 = Sunday (Sakamoto)
+    static const int t[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+    if (m < 3) y -= 1;
+    return (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;
+}
+
+struct CalMetrics { int m, gap, cellW, cellH, bigH, wdH, w, h; };
+
+static CalMetrics CalMeasure(HDC dc) {
+    CalMetrics c{};
+    c.m = 3;
+    c.gap = std::max(1, g_cfg.spacing);
+    HGDIOBJ old = SelectObject(dc, g_font);
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SIZE a{}, b{};
+    GetTextExtentPoint32W(dc, L"88", 2, &a);
+    GetTextExtentPoint32W(dc, L"Mo", 2, &b);
+    c.cellW = std::max(a.cx, b.cx) + 2 * g_cfg.pad + 4;
+    c.cellH = tm.tmHeight + 2 * g_cfg.vpad + 2;
+    c.wdH = tm.tmHeight + 2;
+    SelectObject(dc, g_calBigFont);
+    GetTextMetricsW(dc, &tm);
+    c.bigH = tm.tmHeight + 2 * g_cfg.vpad + 2;
+    SelectObject(dc, old);
+    c.w = 2 * c.m + 7 * c.cellW + 6 * c.gap;
+    c.h = 2 * c.m + c.bigH + c.gap + c.cellH + c.gap + c.cellH + c.gap + c.wdH + c.gap + 6 * c.cellH + 5 * c.gap;
+    return c;
+}
+
+static void CalCell(HDC dc, RECT r, bool pressed, COLORREF border, COLORREF face, COLORREF txt, const wchar_t* s,
+                    UINT align = DT_CENTER) {
+    DrawButton(dc, r, pressed, border, face, txt, {});
+    int sh = pressed ? 1 : 0;
+    RECT tr{r.left + 1 + g_cfg.pad + sh, r.top + 1 + sh, r.right - 1 - g_cfg.pad + sh, r.bottom - 1 + sh};
+    SetTextColor(dc, txt);
+    DrawTextW(dc, s, -1, &tr, align | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
+}
+
+static void CalPaint(HWND h) {
+    PAINTSTRUCT ps;
+    HDC hdc = BeginPaint(h, &ps);
+    RECT cr;
+    GetClientRect(h, &cr);
+    HDC dc = CreateCompatibleDC(hdc);
+    HBITMAP bmp = CreateCompatibleBitmap(hdc, cr.right, cr.bottom);
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+    HGDIOBJ oldFont = SelectObject(dc, g_font);
+    SetBkMode(dc, TRANSPARENT);
+    Fill(dc, cr, g_cfg.bg);
+    Fill(dc, RECT{0, 0, cr.right, 1}, g_cfg.hi);              // panel bevel: lit top-left edge
+    Fill(dc, RECT{0, 0, 1, cr.bottom}, g_cfg.hi);
+    g_calHits.clear();
+
+    CalMetrics c = CalMeasure(dc);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    static const wchar_t* DL[] = {L"Sunday", L"Monday", L"Tuesday", L"Wednesday", L"Thursday", L"Friday", L"Saturday"};
+    static const wchar_t* ML[] = {L"January", L"February", L"March", L"April", L"May", L"June", L"July",
+                                  L"August", L"September", L"October", L"November", L"December"};
+    static const wchar_t* WD[] = {L"Su", L"Mo", L"Tu", L"We", L"Th", L"Fr", L"Sa"};
+    int x0 = c.m, x1 = cr.right - c.m, y = c.m;
+    wchar_t buf[96];
+
+    // live time
+    if (g_cfg.clock24) wsprintfW(buf, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
+    else wsprintfW(buf, L"%d:%02d:%02d %s", (st.wHour + 11) % 12 + 1, st.wMinute, st.wSecond, st.wHour < 12 ? L"AM" : L"PM");
+    SelectObject(dc, g_calBigFont);
+    CalCell(dc, RECT{x0, y, x1, y + c.bigH}, false, g_cfg.outline, g_cfg.clockFace, g_cfg.hoverText, buf);
+    SelectObject(dc, g_font);
+    y += c.bigH + c.gap;
+
+    // full date
+    wsprintfW(buf, L"%s, %s %d, %d", DL[st.wDayOfWeek], ML[st.wMonth - 1], st.wDay, st.wYear);
+    CalCell(dc, RECT{x0, y, x1, y + c.cellH}, false, g_cfg.outline, g_cfg.clockFace, g_cfg.text, buf);
+    y += c.cellH + c.gap;
+
+    // month navigation
+    RECT rp{x0, y, x0 + c.cellW, y + c.cellH}, rn{x1 - c.cellW, y, x1, y + c.cellH};
+    RECT rt{rp.right + c.gap, y, rn.left - c.gap, y + c.cellH};
+    CalCell(dc, rp, false, g_cfg.outline, HoverFace(g_cfg.face, g_calHover == CAL_PREV),
+            g_calHover == CAL_PREV ? g_cfg.hoverText : g_cfg.text, L"<");
+    CalCell(dc, rn, false, g_cfg.outline, HoverFace(g_cfg.face, g_calHover == CAL_NEXT),
+            g_calHover == CAL_NEXT ? g_cfg.hoverText : g_cfg.text, L">");
+    wsprintfW(buf, L"%s %d", ML[g_calMonth - 1], g_calYear);
+    CalCell(dc, rt, false, g_cfg.outline, HoverFace(g_cfg.face, g_calHover == CAL_TITLE),
+            g_calHover == CAL_TITLE ? g_cfg.hoverText : g_cfg.text, buf);
+    g_calHits.push_back({rp, CAL_PREV});
+    g_calHits.push_back({rn, CAL_NEXT});
+    g_calHits.push_back({rt, CAL_TITLE});
+    y += c.cellH + c.gap;
+
+    // weekday names
+    SetTextColor(dc, g_cfg.dim);
+    for (int col = 0; col < 7; ++col) {
+        int cx = x0 + col * (c.cellW + c.gap);
+        RECT r{cx, y, cx + c.cellW, y + c.wdH};
+        DrawTextW(dc, WD[(col + g_cfg.weekStart) % 7], -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    y += c.wdH + c.gap;
+
+    // 6-week grid
+    int first = Weekday(g_calYear, g_calMonth, 1);
+    int offset = (first - g_cfg.weekStart + 7) % 7;
+    int pm = g_calMonth == 1 ? 12 : g_calMonth - 1, py = g_calMonth == 1 ? g_calYear - 1 : g_calYear;
+    int nm = g_calMonth == 12 ? 1 : g_calMonth + 1, ny = g_calMonth == 12 ? g_calYear + 1 : g_calYear;
+    int dim = DaysIn(g_calYear, g_calMonth), dimPrev = DaysIn(py, pm);
+    for (int i = 0; i < 42; ++i) {
+        int d = i - offset + 1, cy = g_calYear, cm = g_calMonth;
+        bool inMonth = true;
+        if (d < 1) { d += dimPrev; cy = py; cm = pm; inMonth = false; }
+        else if (d > dim) { d -= dim; cy = ny; cm = nm; inMonth = false; }
+        bool today = cy == st.wYear && cm == st.wMonth && d == st.wDay;
+        bool hov = g_calHover == CAL_DAY + i;
+        int cx = x0 + (i % 7) * (c.cellW + c.gap), ry = y + (i / 7) * (c.cellH + c.gap);
+        RECT r{cx, ry, cx + c.cellW, ry + c.cellH};
+        wsprintfW(buf, L"%d", d);
+        COLORREF txt = today ? g_cfg.activeText : hov ? g_cfg.hoverText : inMonth ? g_cfg.text : g_cfg.dim;
+        CalCell(dc, r, today, today ? g_cfg.activeBorder : g_cfg.outline,
+                HoverFace(today ? g_cfg.activeFace : g_cfg.face, hov), txt, buf);
+        g_calHits.push_back({r, CAL_DAY + i});
+    }
+
+    BitBlt(hdc, 0, 0, cr.right, cr.bottom, dc, 0, 0, SRCCOPY);
+    SelectObject(dc, oldFont);
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    EndPaint(h, &ps);
+}
+
+static void CalHide() {
+    if (!g_calHwnd || !IsWindowVisible(g_calHwnd)) return;
+    KillTimer(g_calHwnd, TIMER_CAL);
+    ShowWindow(g_calHwnd, SW_HIDE);
+    g_calClosedAt = GetTickCount();
+}
+
+static void CalShiftMonth(int delta) {
+    int idx = g_calYear * 12 + (g_calMonth - 1) + delta;
+    g_calYear = idx / 12;
+    g_calMonth = idx % 12 + 1;
+    InvalidateRect(g_calHwnd, nullptr, FALSE);
+}
+
+static void CalToday() {
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    g_calYear = st.wYear;
+    g_calMonth = st.wMonth;
+}
+
+static LRESULT CALLBACK CalProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_PAINT: CalPaint(h); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_TIMER:
+        if (wp == TIMER_CAL) {
+            POINT pt;
+            GetCursorPos(&pt);
+            RECT cal, bar;
+            GetWindowRect(h, &cal);
+            GetWindowRect(g_hwnd, &bar);
+            bool over = PtInRect(&cal, pt) != 0;
+            for (auto& rw : g_rows)
+                if (rw.kind == K_CLOCK) {
+                    RECT cr = rw.r;
+                    OffsetRect(&cr, bar.left, bar.top);
+                    if (PtInRect(&cr, pt)) over = true;
+                }
+            DWORD now = GetTickCount();
+            if (over) g_calLastHover = now;
+            else if (now - g_calLastHover >= (DWORD)g_cfg.calTimeout * 1000) { CalHide(); return 0; }
+            SYSTEMTIME st;
+            GetLocalTime(&st);
+            if (st.wSecond != g_calLastSecond) { g_calLastSecond = st.wSecond; InvalidateRect(h, nullptr, FALSE); }
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) CalHide();
+        else if (wp == VK_LEFT || wp == VK_PRIOR) CalShiftMonth(-1);
+        else if (wp == VK_RIGHT || wp == VK_NEXT) CalShiftMonth(1);
+        else if (wp == VK_HOME) { CalToday(); InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_MOUSEWHEEL:
+        CalShiftMonth(GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1);
+        return 0;
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, h, 0};
+        TrackMouseEvent(&tme);
+        POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
+        int hit = 0;
+        for (auto& c : g_calHits) if (PtInRect(&c.r, pt)) { hit = c.id; break; }
+        if (hit != g_calHover) { g_calHover = hit; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        if (g_calHover) { g_calHover = 0; InvalidateRect(h, nullptr, FALSE); }
+        return 0;
+    case WM_LBUTTONUP: {
+        POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
+        for (auto& c : g_calHits) {
+            if (!PtInRect(&c.r, pt)) continue;
+            if (c.id == CAL_PREV) CalShiftMonth(-1);
+            else if (c.id == CAL_NEXT) CalShiftMonth(1);
+            else if (c.id == CAL_TITLE) { CalToday(); InvalidateRect(h, nullptr, FALSE); }
+            break;
+        }
+        return 0;
+    }
+    case WM_RBUTTONUP:
+        CalHide();
+        return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+static void CalToggle() {
+    if (g_calHwnd && IsWindowVisible(g_calHwnd)) { CalHide(); return; }
+    if (!g_calHwnd) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = CalProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"VBarCal";
+        RegisterClassExW(&wc);
+        g_calHwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE, L"VBarCal", L"vbar calendar", WS_POPUP,
+                                    0, 0, 10, 10, g_hwnd, nullptr, wc.hInstance, nullptr);
+        if (!g_calHwnd) return;
+    }
+    CalToday();
+    g_calHover = 0;
+
+    HDC sdc = GetDC(nullptr);
+    CalMetrics c = CalMeasure(sdc);
+    ReleaseDC(nullptr, sdc);
+
+    // Beside the bar on its inner side, bottom-aligned with the clock, kept on the bar's monitor.
+    RECT bar;
+    GetWindowRect(g_hwnd, &bar);
+    int clockBottom = bar.bottom;
+    for (auto& rw : g_rows) if (rw.kind == K_CLOCK) clockBottom = bar.top + rw.r.bottom;
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+    int x = g_cfg.rightSide ? bar.left - c.w - 2 : bar.right + 2;
+    int y = std::max((int)mi.rcMonitor.top, std::min(clockBottom, (int)mi.rcMonitor.bottom) - c.h);
+    SetWindowPos(g_calHwnd, HWND_TOPMOST, x, y, c.w, c.h, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    g_calLastHover = GetTickCount();
+    SetTimer(g_calHwnd, TIMER_CAL, 200, nullptr);
+    InvalidateRect(g_calHwnd, nullptr, FALSE);
 }
 
 // ---------- window proc ----------
@@ -1880,6 +2182,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const Row* r = HitTest((short)LOWORD(lp), (short)HIWORD(lp));
         if (!r) return 0;
         if (r->kind == K_START) { PressKeys({VK_LWIN}); return 0; }
+        if (r->kind == K_CLOCK) { CalToggle(); return 0; }
         if (r->kind == K_PIN && r->idx < PinCount()) LaunchPin(PinAt(r->idx));
         else if (r->kind == K_TASK && r->idx < (int)g_tasks.size()) ActivateOrMinimize(g_tasks[r->idx].hwnd);
         RefreshTasks();
@@ -1928,6 +2231,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (!g_loadedFontFile.empty()) RemoveFontResourceExW(g_loadedFontFile.c_str(), FR_PRIVATE, nullptr);
         if (g_font) DeleteObject(g_font);
         if (g_clockFont) DeleteObject(g_clockFont);
+        if (g_calBigFont) DeleteObject(g_calBigFont);
+        if (g_calHwnd) DestroyWindow(g_calHwnd);
         g_pinIcons.clear();
         g_tasks.clear();
         if (g_iconDC) DeleteDC(g_iconDC);
