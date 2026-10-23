@@ -5,7 +5,7 @@
 // Build (MSVC, x64 Native Tools prompt):
 //   cl /O2 /EHsc /DUNICODE /D_UNICODE vbar.cpp /link /SUBSYSTEM:WINDOWS
 // Build (MinGW-w64):
-//   g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32
+//   g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32 -ladvapi32
 //
 // First run writes vbar.ini next to the exe. Edit it, then right-click the clock > Reload.
 
@@ -44,9 +44,10 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "msimg32.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
-#define VBAR_VERSION L"1.3"
+#define VBAR_VERSION L"1.4"
 
 #define WM_APPBAR    (WM_APP + 1)
 #define WM_STARTPINS (WM_APP + 2)
@@ -62,6 +63,7 @@
 #define IDM_SIDE_LEFT 110
 #define IDM_SIDE_RIGHT 111
 #define IDM_CLOCK24 112
+#define IDM_AUTOSTART 113
 #define IDM_MON_PRIMARY 119
 #define IDM_MON_BASE 120
 #define IDM_T_SWITCH   200
@@ -1645,6 +1647,41 @@ static void SetIniValue(const std::wstring& key, const std::wstring& value) {
     o << WToUtf8(out);
 }
 
+// ---------- start with Windows ----------
+// A per-user Run entry (HKCU, no admin needed) pointing at this exe's current location.
+
+static const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+static std::wstring ExePath() {
+    wchar_t exe[MAX_PATH * 2];
+    DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH * 2);
+    return std::wstring(exe, n);
+}
+
+// True only if the entry exists and points at this exe (a stale path from a moved exe counts as off).
+static bool AutostartEnabled() {
+    wchar_t val[MAX_PATH * 2 + 8];
+    DWORD size = sizeof(val), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, L"vbar", RRF_RT_REG_SZ, &type, val, &size) != ERROR_SUCCESS)
+        return false;
+    std::wstring v = val;
+    v.erase(std::remove(v.begin(), v.end(), L'"'), v.end());
+    return _wcsicmp(Trim(v).c_str(), ExePath().c_str()) == 0;
+}
+
+static void SetAutostart(bool on) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS)
+        return;
+    if (on) {
+        std::wstring cmd = L"\"" + ExePath() + L"\"";
+        RegSetValueExW(k, L"vbar", 0, REG_SZ, (const BYTE*)cmd.c_str(), (DWORD)((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(k, L"vbar");
+    }
+    RegCloseKey(k);
+}
+
 static void ShowMenu(POINT screenPt) {
     HMENU m = CreatePopupMenu();
 
@@ -1664,6 +1701,8 @@ static void ShowMenu(POINT screenPt) {
     AppendMenuW(screens, MF_STRING | (g_cfg.rightSide ? MF_CHECKED : 0), IDM_SIDE_RIGHT, L"Right edge");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)screens, L"Position");
     AppendMenuW(m, MF_STRING | (g_cfg.clock24 ? MF_CHECKED : 0), IDM_CLOCK24, L"24-hour clock");
+    bool autostart = AutostartEnabled();
+    AppendMenuW(m, MF_STRING | (autostart ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with Windows");
 
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_RELOAD, L"Reload config + Start pins");
@@ -1675,7 +1714,9 @@ static void ShowMenu(POINT screenPt) {
     int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screenPt.x, screenPt.y, 0, g_hwnd, nullptr);
     PostMessageW(g_hwnd, WM_NULL, 0, 0);
     DestroyMenu(m);
-    if (cmd == IDM_CLOCK24) {
+    if (cmd == IDM_AUTOSTART) {
+        SetAutostart(!autostart);
+    } else if (cmd == IDM_CLOCK24) {
         SetIniValue(L"clock24", g_cfg.clock24 ? L"0" : L"1");
         Reload();
     } else if (cmd == IDM_SIDE_LEFT || cmd == IDM_SIDE_RIGHT) {

@@ -21,7 +21,7 @@ Vertical minimalist task bar for Windows 11 (also runs on Windows 10). Every run
 
 1. Download [`bin/vbar.exe`](bin/vbar.exe) (click it, then **Download raw file**) and put it in its own folder.
 2. Run it. It writes `vbar.ini` next to itself on first launch.
-3. To start it with Windows, put a shortcut to `vbar.exe` in `shell:startup`.
+3. To start it with Windows, right-click the clock and tick **Start with Windows**. This adds a per-user startup entry pointing at wherever `vbar.exe` currently is, so if you move the exe, tick it again.
 
 To replace the Windows taskbar entirely: turn on taskbar auto-hide in Windows settings, then set `hidetaskbar=1`. The real taskbar comes back when vbar exits.
 
@@ -30,7 +30,7 @@ To replace the Windows taskbar entirely: turn on taskbar auto-hide in Windows se
 | Hover | Bring to front | — | — |
 | Left-click | Focus, or minimize if already focused | Launch | Clock: calendar · start button: Start menu |
 | Middle-click | Close | — | — |
-| Right-click | Window menu | Pin menu | Position, reload, edit config, exit (start button: Win+X menu) |
+| Right-click | Window menu | Pin menu | Position, 24-hour clock, start with Windows, reload, edit config, exit (start button: Win+X menu) |
 | Wheel | Scroll the window list | Scroll the pinned list | — |
 
 ## Configuration
@@ -70,7 +70,7 @@ cl /O2 /EHsc /DUNICODE /D_UNICODE vbar.cpp /link /SUBSYSTEM:WINDOWS
 
 MinGW-w64:
 ```
-g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32
+g++ -O2 -municode -mwindows -static vbar.cpp -o vbar.exe -ldwmapi -lgdi32 -luser32 -lshell32 -lole32 -luuid -lmsimg32 -ladvapi32
 ```
 
 ## License
